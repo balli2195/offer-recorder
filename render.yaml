@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: offer-recorder
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    disk:
+      name: recorder-store
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: AWS_REGION
+        value: us-east-1
+      - key: QUEUE_URL
+        value: https://sqs.us-east-1.amazonaws.com/420826709918/offer-changes
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: RECORDER_KEY
+        sync: false
+      - key: SS_BOX_URL
+        sync: false
+      - key: SS_BOX_KEY
+        sync: false
+      - key: SPAPI_CLIENT_ID
+        sync: false
+      - key: SPAPI_CLIENT_SECRET
+        sync: false
+      - key: SPAPI_REFRESH_TOKEN
+        sync: false
