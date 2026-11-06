@@ -54,3 +54,31 @@ def test_keys_required_and_path_safe():
 def test_import_does_not_start_threads():
     assert A._started is False
     assert 'pid' not in A.STATE
+
+class R:
+    def __init__(self, code, data=None): self.status_code = code; self._d = data or {}
+    def json(self): return self._d
+    def raise_for_status(self):
+        if self.status_code >= 300: raise RuntimeError(self.status_code)
+
+def test_segments_sweep_batches_saves_and_backs_off(monkeypatch):
+    A.IN_STOCK = [f'A{i:03d}' for i in range(45)]
+    calls = []; waits = []
+    def post(url, headers, json, timeout):
+        calls.append([r['asin'] for r in json['requests']])
+        assert all(r['includedData'] == ['featuredBuyingOptions'] for r in json['requests'])
+        if len(calls) == 2: return R(429)
+        return R(200, {'responses': [{'status': {'statusCode': 200}, 'body': {'asin': r['asin'], 'featuredBuyingOptions': []}} for r in json['requests']]})
+    monkeypatch.setattr(A.requests, 'post', post)
+    monkeypatch.setattr(A, 'sp_token', lambda: 't')
+    before = A.STATE['segments']['saved']
+    assert A.segments_sweep(wait=waits.append) is True
+    assert [len(c) for c in calls] == [20, 20, 20, 5]          # the throttled batch was retried
+    assert A.STATE['segments']['saved'] - before == 45 and A.STATE['segments']['throttled'] == 1
+    assert A.SEG_GAP * 2 in waits and waits.count(A.SEG_GAP) == 3
+    assert A.STATE['segments']['asins'] == 45
+
+def test_snapshot_keeps_only_in_stock_asins(monkeypatch):
+    monkeypatch.setattr(A, 'box_listings', lambda: {'rows': [{'asin': 'X', 'qty': 2}, {'asin': 'X', 'qty': 1}, {'asin': 'Y', 'qty': 0}, {'asin': 'Z', 'qty': None}, {'asin': None, 'qty': 3}]})
+    A.snapshot_listings()
+    assert A.IN_STOCK == ['X']

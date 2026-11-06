@@ -1,7 +1,8 @@
 """Offer recorder (Nick, Nov 2026). Read-only: records what Seller Snap and the market do. It cannot change prices.
-Three loops write gzip JSONL to the Render disk:
+Four loops write gzip JSONL to the Render disk:
   offers/   every ANY_OFFER_CHANGED message from SQS, raw (saved to disk before it is deleted from the queue)
   listings/ Seller Snap listing snapshot, hourly, through the Seller Snap box (read action only)
+  segments/ Amazon's Featured Offer breakdown (competitive summary) for every in-stock ASIN, one call per 31 s, about 15 min a sweep
   orders/   Amazon all-orders report, daily, last 8 days, with customer location columns removed
 Endpoints: /healthz (open); /status, /files, /files/<path> (header X-Recorder-Key).
 Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QUEUE_URL, RECORDER_KEY, SS_BOX_URL, SS_BOX_KEY,
@@ -16,6 +17,7 @@ QUEUE = os.environ.get('QUEUE_URL', '')
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
 KEY = os.environ.get('RECORDER_KEY', '')
 MIN_FREE = float(os.environ.get('MIN_FREE_FRAC', '0.05'))
+SEG_GAP = float(os.environ.get('SEG_GAP_S', '31'))  # Amazon's limit for this call is 0.033 requests/second
 SNAP_EVERY = int(os.environ.get('SNAP_EVERY_S', '3600'))
 ORDER_EVERY = int(os.environ.get('ORDER_EVERY_S', '86400'))
 SP = 'https://sellingpartnerapi-na.amazon.com'
@@ -26,8 +28,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger('recorder')
 app = Flask(__name__)
 STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent': None, 'last_error': None, 'paused_low_disk': False},
+         'segments': {'sweeps': 0, 'last_sweep': None, 'asins': None, 'saved': 0, 'throttled': 0, 'last_saved': None, 'last_error': None},
          'listings': {'last': None, 'rows': None, 'last_error': None}, 'orders': {'last': None, 'rows': None, 'last_error': None}}
 LOCK = threading.Lock()
+IN_STOCK = []  # ASINs with FBA stock, from the latest Seller Snap snapshot
 
 
 def now():
@@ -126,7 +130,10 @@ def snapshot_listings():
     rows = res['rows']
     line = json.dumps({'taken_at': iso(t), 'exportedAt': res.get('exportedAt'), 'rows': rows})
     append_gz(os.path.join(DATA, 'listings', t.strftime('%Y-%m-%d') + '.jsonl.gz'), [line])
+    asins = sorted({r['asin'] for r in rows if r.get('asin') and (r.get('qty') or 0) > 0})
+    global IN_STOCK
     with LOCK:
+        IN_STOCK = asins
         STATE['listings'].update(last=iso(t), rows=len(rows), last_error=None)
 
 
@@ -135,6 +142,69 @@ def sp_token():
                       'client_id': os.environ['SPAPI_CLIENT_ID'], 'client_secret': os.environ['SPAPI_CLIENT_SECRET']}, timeout=30)
     r.raise_for_status()
     return r.json()['access_token']
+
+
+def segment_batch(asins, token):
+    """One competitive summary call for up to 20 ASINs. Saves each ASIN's raw response. Returns False if Amazon throttled us."""
+    b = {'requests': [{'asin': a, 'marketplaceId': MP, 'includedData': ['featuredBuyingOptions'], 'method': 'GET',
+                       'uri': '/products/pricing/2022-05-01/items/competitiveSummary'} for a in asins]}
+    r = requests.post(f'{SP}/batches/products/pricing/2022-05-01/items/competitiveSummary',
+                      headers={'x-amz-access-token': token, 'content-type': 'application/json'}, json=b, timeout=60)
+    if r.status_code == 429:
+        with LOCK:
+            STATE['segments']['throttled'] += 1
+        return False
+    r.raise_for_status()
+    t = now()
+    lines = []
+    for a, x in zip(asins, r.json().get('responses') or []):
+        body = x.get('body') or {}
+        lines.append(json.dumps({'taken_at': iso(t), 'asin': body.get('asin') or a, 'status': (x.get('status') or {}).get('statusCode'), 'body': body}))
+    append_gz(os.path.join(DATA, 'segments', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
+    with LOCK:
+        STATE['segments']['saved'] += len(lines)
+        STATE['segments']['last_saved'] = iso(t)
+    return True
+
+
+def segments_sweep(wait=time.sleep):
+    with LOCK:
+        asins = list(IN_STOCK)
+    if not asins:
+        return False
+    token = sp_token()
+    for i in range(0, len(asins), 20):
+        batch = asins[i:i + 20]
+        tries = 0
+        while True:
+            if free_frac() < MIN_FREE:
+                return False
+            if segment_batch(batch, token):
+                wait(SEG_GAP)
+                break
+            tries += 1
+            wait(min(300, SEG_GAP * 2 ** tries))
+            if tries >= 5:  # skip this batch; the next sweep gets it
+                break
+    with LOCK:
+        STATE['segments'].update(sweeps=STATE['segments']['sweeps'] + 1, last_sweep=iso(), asins=len(asins), last_error=None)
+    return True
+
+
+def segments_loop():
+    if not all(os.environ.get(n) for n in ('SPAPI_CLIENT_ID', 'SPAPI_CLIENT_SECRET', 'SPAPI_REFRESH_TOKEN')):
+        with LOCK:
+            STATE['segments']['last_error'] = 'not configured'
+        return
+    while True:
+        try:
+            if not segments_sweep():
+                time.sleep(60)
+        except Exception as e:
+            log.exception('segments')
+            with LOCK:
+                STATE['segments']['last_error'] = f'{iso()} {type(e).__name__}: {str(e)[:200]}'
+            time.sleep(120)
 
 
 def strip_orders(tsv):
@@ -245,5 +315,6 @@ def start():
     STATE['started'] = iso()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
+    threading.Thread(target=segments_loop, daemon=True).start()
     threading.Thread(target=every, args=('listings', SNAP_EVERY, snapshot_listings, ['SS_BOX_URL', 'SS_BOX_KEY']), daemon=True).start()
     threading.Thread(target=every, args=('orders', ORDER_EVERY, pull_orders, ['SPAPI_CLIENT_ID', 'SPAPI_CLIENT_SECRET', 'SPAPI_REFRESH_TOKEN']), daemon=True).start()
