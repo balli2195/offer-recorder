@@ -208,6 +208,7 @@ def status():
     u = shutil.disk_usage(DATA)
     with LOCK:
         s = json.loads(json.dumps(STATE))
+    s['status_pid'] = os.getpid()
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
     return jsonify(s)
 
@@ -230,12 +231,19 @@ def file_get(p):
     return send_from_directory(DATA, p, as_attachment=True)
 
 
+_started = False
+
+
 def start():
+    """Called from gunicorn's post_fork hook (gunicorn.conf.py), never at import: if the app is preloaded, threads started
+    at import would run in the master process, and the worker answering /status would never see their state."""
+    global _started
+    if _started:
+        return
+    _started = True
     os.makedirs(DATA, exist_ok=True)
     STATE['started'] = iso()
+    STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
     threading.Thread(target=every, args=('listings', SNAP_EVERY, snapshot_listings, ['SS_BOX_URL', 'SS_BOX_KEY']), daemon=True).start()
     threading.Thread(target=every, args=('orders', ORDER_EVERY, pull_orders, ['SPAPI_CLIENT_ID', 'SPAPI_CLIENT_SECRET', 'SPAPI_REFRESH_TOKEN']), daemon=True).start()
-
-
-start()

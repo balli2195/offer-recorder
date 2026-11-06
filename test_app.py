@@ -50,3 +50,7 @@ def test_keys_required_and_path_safe():
     assert c.get('/status', headers=h).status_code == 200
     assert c.get('/files', headers=h).status_code == 200
     assert c.get('/files/../../etc/passwd', headers=h).status_code in (404, 400)
+
+def test_import_does_not_start_threads():
+    assert A._started is False
+    assert 'pid' not in A.STATE
