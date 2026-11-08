@@ -34,3 +34,5 @@ services:
         sync: false
       - key: SPAPI_REFRESH_TOKEN
         sync: false
+      - key: KEEPA_KEY
+        sync: false
