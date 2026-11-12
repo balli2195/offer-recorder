@@ -177,6 +177,7 @@ def sp_token():
 SH = _shadow.Shadow(DATA, append_gz, iso)
 LV = _live.Live(DATA, append_gz, iso, sp_token)
 SH.on_decision = LV.maybe_apply
+SH.tune_fn = lambda: LV.cfg
 
 
 def segment_batch(asins, token):
@@ -530,9 +531,29 @@ def model_upload():
 def shadow_recent():
     need_key()
     n = int(request.args.get('n', 50))
-    act = request.args.get('action')
-    rows = [d for d in list(SH.recent) if not act or d['action'] == act]
+    act, asin, sku = request.args.get('action'), request.args.get('asin'), request.args.get('sku')
+    rows = [d for d in list(SH.recent) if (not act or d['action'] == act) and (not asin or d['asin'] == asin) and (not sku or d['sku'] == sku)]
     return jsonify(rows[-n:])
+
+
+@app.get('/repricer/skus')
+def repricer_skus():
+    """Every priced SKU with its Seller Snap settings and the latest shadow decision, for the hub's Repricer page."""
+    need_key()
+    live_set = set(LV.cfg.get('skus') or [])
+    out = []
+    for asin, s in list(SH.listings.items()):
+        d = SH.latest.get(asin) or {}
+        out.append({'asin': asin, 'sku': s['sku'], 'title': s.get('title'), 'min': s['min'], 'max': s['max'], 'cost': s['cost'], 'qty': s.get('qty'),
+                    'ss_repricing': s.get('ss_repricing'), 'live': s['sku'] in live_set, 'fulfillable': SH.stock.get(s['sku']),
+                    'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'foep', 'gain_24h', 'winner')} if d else None})
+    return jsonify(out)
+
+
+@app.get('/live/log')
+def live_log():
+    need_key()
+    return jsonify(LV.recent_log(int(request.args.get('days', 3)))[:int(request.args.get('n', 200))])
 
 
 @app.get('/live')

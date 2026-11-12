@@ -12,7 +12,9 @@ import requests
 SP = 'https://sellingpartnerapi-na.amazon.com'
 MP = 'ATVPDKIKX0DER'
 ME = 'A2UYRB3AYUMGAJ'
-DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s': 600, 'max_per_day': 24}
+DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s': 600, 'max_per_day': 24,
+            # decision tuning, used by shadow and live alike
+            'decay_per_day': 0.003, 'min_gain_abs': 0.50, 'min_gain_rel': 0.05}
 
 
 class Live:
@@ -36,6 +38,7 @@ class Live:
         try:
             with open(self.cfg_path()) as f:
                 c.update(json.load(f))
+            c = {**DEFAULTS, **c}
         except FileNotFoundError:
             pass
         self.stats.update(enabled=bool(c['enabled']), skus=len(c['skus']))
@@ -50,6 +53,9 @@ class Live:
         c['max_step_pct'] = float(min(max(c['max_step_pct'], 0.5), 10.0))
         c['min_interval_s'] = int(max(c['min_interval_s'], 120))
         c['max_per_day'] = int(min(max(c['max_per_day'], 1), 96))
+        c['decay_per_day'] = float(min(max(c['decay_per_day'], 0.0), 0.02))
+        c['min_gain_abs'] = float(min(max(c['min_gain_abs'], 0.0), 50.0))
+        c['min_gain_rel'] = float(min(max(c['min_gain_rel'], 0.0), 1.0))
         os.makedirs(os.path.dirname(self.cfg_path()), exist_ok=True)
         tmp = self.cfg_path() + '.tmp'
         with open(tmp, 'w') as f:
@@ -156,3 +162,14 @@ class Live:
         t = dt.datetime.now(dt.timezone.utc)
         self.append_gz(os.path.join(self.data, 'live', t.strftime('%Y-%m-%d') + '.jsonl.gz'), [json.dumps(rec)])
         return rec
+
+    def recent_log(self, days=3):
+        out = []
+        for i in range(days):
+            d = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=i)).strftime('%Y-%m-%d')
+            p = os.path.join(self.data, 'live', d + '.jsonl.gz')
+            if os.path.exists(p):
+                import gzip
+                with gzip.open(p, 'rt') as f:
+                    out += [json.loads(l) for l in f if l.strip()]
+        return sorted(out, key=lambda r: r.get('t') or '', reverse=True)

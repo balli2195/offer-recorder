@@ -169,3 +169,17 @@ def test_shadow_endpoints_and_feed():
     r = c.post('/live', json={'enabled': True, 'skus': ['S1']}, headers=h).get_json(); assert r['config']['enabled'] is True
     assert c.post('/live/stop', headers=h).get_json()['config']['enabled'] is False
     assert c.post('/live', json={}).status_code == 401
+
+def test_repricer_skus_tuning_and_log():
+    import test_shadow as TS
+    c = A.app.test_client(); h = {'X-Recorder-Key': 'k'}
+    c.post('/model', data=json.dumps(TS.MODEL), headers=h)
+    A.SH.on_listings([{'sku': 'S7', 'asin': 'A7', 'title': 'Thing', 'min_price': 25, 'max_price': 40, 'listed_price': 30, 'cost': 15, 'roi': 30, 'v30': 2, 'avg_bb_share': 50, 'repricing': False, 'qty': 5}])
+    r = c.post('/live', json={'skus': ['S7'], 'min_gain_abs': 99, 'decay_per_day': 0.5}, headers=h).get_json()
+    assert r['config']['min_gain_abs'] == 50.0 and r['config']['decay_per_day'] == 0.02   # clamped
+    A.SH.on_message_bodies([TS.body('A7', [(A._shadow.ME, 29.5, True), ('CALM', 30.4, False)])]); A.SH.last_decided.pop('A7', None); A.SH.step()
+    rows = [x for x in c.get('/repricer/skus', headers=h).get_json() if x['sku'] == 'S7']
+    assert rows and rows[0]['live'] is True and rows[0]['ss_repricing'] is False and rows[0]['decision']['action'] == 'hold'   # $50 minimum gain holds everything
+    assert c.get('/shadow?sku=S7', headers=h).get_json()[-1]['sku'] == 'S7'
+    assert c.get('/live/log', headers=h).status_code == 200
+    c.post('/live', json={'min_gain_abs': 0.5, 'decay_per_day': 0.003, 'skus': []}, headers=h)

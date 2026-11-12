@@ -77,7 +77,7 @@ def war_penalty_pct(model, rate):
     return tab[-1][1]
 
 
-def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None):
+def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None):
     """offers: {seller: landed price} for FBA new offers on the listing; winner: Buy Box seller id or None.
     sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None."""
     if ME not in offers or len(offers) < 2:
@@ -92,6 +92,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     share = None
     if my_stock is not None and rival_stock is not None and (my_stock + rival_stock) > 0:
         share = my_stock / (my_stock + rival_stock)
+    tune = tune or {}
+    decay = tune.get('decay_per_day', DECAY_PER_DAY)
+    g_abs = tune.get('min_gain_abs', MIN_GAIN_ABS)
+    g_rel = tune.get('min_gain_rel', MIN_GAIN_REL)
     lo, hi = sku['min'], sku['max']
     if not (lo and hi) or lo > hi:
         return None
@@ -112,7 +116,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     # What is already paid for is sunk: a unit sold now is worth its net proceeds; a unit kept is worth selling it later
     # near today's market low, less the cost of waiting (capital, storage, price erosion) over about half the sell-through time.
     ref_low = 0.08 if low <= 10 else 0.15
-    v_future = (low - (ref_low * low + sku['fixed_fee'])) * (1.0 - DECAY_PER_DAY * days_to_sell / 2.0)
+    v_future = (low - (ref_low * low + sku['fixed_fee'])) * (1.0 - decay * days_to_sell / 2.0)
     exposed = min(qty, max(daily_now, 0.05) * 30.0)   # units whose future value a price war would lower
     rows = []
     for p in cands:
@@ -134,7 +138,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     cur = min(rows, key=lambda r: abs(r['price'] - me))
     best = max(rows, key=lambda r: r['exp_value_24h'])
     gain = best['exp_value_24h'] - cur['exp_value_24h']
-    change = gain >= max(MIN_GAIN_ABS, MIN_GAIN_REL * abs(cur['exp_value_24h'])) and abs(best['price'] - me) >= 0.01
+    change = gain >= max(g_abs, g_rel * abs(cur['exp_value_24h'])) and abs(best['price'] - me) >= 0.01
     rec = best['price'] if change else me
     if not change:
         action = 'hold'
@@ -177,7 +181,9 @@ class Shadow:
         self.last_decided = {}
         self.model = None
         self.on_decision = None
-        self.recent = collections.deque(maxlen=500)
+        self.tune_fn = None      # returns the tuning dict (live config), so settings live in one place
+        self.recent = collections.deque(maxlen=2000)
+        self.latest = {}         # asin -> latest decision
         self.stats = {'model_trained_at': None, 'decisions': 0, 'changes_suggested': 0, 'last_decision': None, 'last_error': None, 'by_action': {}}
         self.load_model()
 
@@ -247,7 +253,7 @@ class Shadow:
             v = r.get('v30') or 0.0
             bbs = r.get('avg_bb_share') if r.get('avg_bb_share') is not None else r.get('bb_share')
             bbs = clip((bbs or 25.0) / 100.0, 0.25, 1.0)  # conservative: at most 4x current sales if Nick won every Buy Box
-            out[a] = {'sku': r['sku'], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': cost,
+            out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': cost,
                       'fixed_fee': max(0.0, fees - ref * lp), 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
         with self.lock:
             self.listings = out
@@ -301,7 +307,8 @@ class Shadow:
         t, offs, win = o
         foep, age = (fo[1], time.time() - fo[0]) if fo else (None, None)
         rstock = rs[1] if (rs and time.time() - rs[0] < 8 * 3600) else None
-        return decide(model, asin, offs, win, sku, foep, age, st, rstock)
+        tune = self.tune_fn() if self.tune_fn else None
+        return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune)
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""
@@ -326,6 +333,7 @@ class Shadow:
                 except Exception as e:
                     d['live'] = {'error': f'{type(e).__name__}: {str(e)[:200]}'}
             self.recent.append(d)
+            self.latest[a] = d
             lines.append(json.dumps(d))
             self.stats['decisions'] += 1
             self.stats['by_action'][d['action']] = self.stats['by_action'].get(d['action'], 0) + 1
