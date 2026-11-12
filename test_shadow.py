@@ -221,3 +221,23 @@ def test_suppressed_list(tmp_path):
     r = L[0]
     assert r['competitive_price'] == 29.0 and r['was_price'] == 41.46 and r['status'].startswith('below your break-even')
     assert r['breakeven'] and abs(S.margin(r['breakeven'], dict(SKU, cost=25.0, fees=BANDS))) < 0.05 and r['inventory'] == round(24 * (25 + S.PREP), 2)
+
+
+def test_listing_states_and_table(tmp_path):
+    sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda: 'now')
+    sh.on_listings([{'sku': 'A', 'asin': 'X1', 'min_price': 20, 'max_price': 40, 'listed_price': 30, 'cost': 10, 'roi': 30, 'v30': 1, 'qty': 5, 'repricing': True},
+                    {'sku': 'B', 'asin': 'X2', 'min_price': 20, 'max_price': 40, 'listed_price': 30, 'cost': 10, 'roi': 30, 'v30': 1, 'qty': 0},
+                    {'sku': 'C', 'asin': 'X3', 'min_price': 20, 'max_price': 40, 'listed_price': 30, 'cost': 10, 'roi': 30, 'v30': 1, 'qty': 3},
+                    {'sku': 'D', 'asin': 'X4', 'min_price': 20, 'max_price': 40, 'listed_price': 30, 'cost': 10, 'roi': 30, 'v30': 1, 'qty': 0}])
+    sh.on_inventory([{'sellerSku': 'A', 'inventoryDetails': {'fulfillableQuantity': 5, 'inboundShippedQuantity': 2}},
+                     {'sellerSku': 'C', 'inventoryDetails': {'fulfillableQuantity': 3}}])
+    sh.on_catalog([{'seller-sku': 'A', 'asin1': 'X1', 'status': 'Active', 'fulfillment-channel': 'AMAZON_NA'},
+                   {'seller-sku': 'B', 'asin1': 'X2', 'status': 'Inactive', 'fulfillment-channel': 'AMAZON_NA'},
+                   {'seller-sku': 'C', 'asin1': 'X3', 'status': 'Inactive', 'fulfillment-channel': 'AMAZON_NA'},
+                   {'seller-sku': 'E', 'asin1': 'X5', 'status': 'Inactive', 'fulfillment-channel': 'DEFAULT', 'item-name': 'Old MFN'}])
+    T = {r['sku']: r for r in sh.table(['A'])}
+    assert T['A']['state'] == 'active' and T['A']['live'] and T['A']['inbound'] == 2 and T['A']['ss_repricing'] is True
+    assert T['B']['state'] == 'out_of_stock' and T['C']['state'] == 'deactivated' and T['D']['state'] == 'archived'
+    assert T['E']['state'] == 'archived' and not T['E'].get('in_seller_snap') and T['E']['channel'] == 'MFN'
+    sh.on_fyp([{'Status': 'Search Suppressed', 'Reason': 'Missing info', 'SKU': 'A'}])
+    assert {r['sku']: r for r in sh.table()}['A']['state'] == 'deactivated'

@@ -9,6 +9,7 @@ Four loops write gzip JSONL to the Render disk:
   foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
   health/   daily seller performance report (account status, metrics) and suppressed-listings report
   keepa/    Keepa live offers with stock for in-stock ASINs, every 6 h, full responses (needs KEEPA_KEY)
+  catalog/  Amazon's all-listings report (every SKU with Active / Inactive / Incomplete), every 3 h, full TSV
   fees/     Amazon's fee estimate (Product Fees API) for every sellable SKU at a price in each fee band; daily per SKU, full responses
 Endpoints: /healthz (open); /status, /files, /files/<path> (header X-Recorder-Key).
 Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QUEUE_URL, RECORDER_KEY, SS_BOX_URL, SS_BOX_KEY,
@@ -47,7 +48,8 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'foep': {'sweeps': 0, 'last_sweep': None, 'skus': None, 'saved': 0, 'throttled': 0, 'last_error': None},
          'health': {'last': None, 'account_status': None, 'suppressed_rows': None, 'last_error': None},
          'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None},
-         'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None}}
+         'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None},
+         'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None}}
 # What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
 STREAMS = {
     'offers': ('Offer changes', 'continuous', 'Every Amazon offer-change message for your listings (SQS), saved raw before it leaves the queue.'),
@@ -59,6 +61,7 @@ STREAMS = {
     'health': ('Account health', 'daily', 'Seller performance report and suppressed listings.'),
     'keepa': ('Keepa rival stock', 'every 6 h', 'Live offers with stock for in-stock ASINs, full Keepa responses.'),
     'fees': ('Amazon fees', 'daily per SKU, hourly for new SKUs', "Amazon's own fee estimate for every sellable SKU at a price under $10, $10-$50 and over $50, used by the repricer."),
+    'catalog': ('Amazon listing status', 'every 3 h', "Amazon's all-listings report: every SKU on the account with Active / Inactive / Incomplete, so the Repricer page can show each listing's state."),
     'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
     'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
 }
@@ -438,11 +441,35 @@ def snapshot_health():
     supp = run_report('GET_MERCHANTS_LISTINGS_FYP_REPORT').decode('utf-8-sig', errors='replace')
     status = ','.join(f"{x.get('marketplaceId')}:{x.get('status')}" for x in perf.get('accountStatuses') or [])
     nrows = max(0, len([l for l in supp.splitlines() if l.strip()]) - 1)
+    if SH:
+        _safe(SH.on_fyp, tsv_rows(supp))
     write_once(os.path.join(DATA, 'health', t.strftime('%Y-%m-%d') + '.jsonl.gz'),
                [json.dumps({'taken_at': iso(t), 'report': 'seller_performance', 'body': perf}),
                 json.dumps({'taken_at': iso(t), 'report': 'suppressed_listings', 'tsv': supp})])
     with LOCK:
         STATE['health'].update(last=iso(t), account_status=status, suppressed_rows=nrows, last_error=None)
+
+
+CATALOG_EVERY = int(os.environ.get('CATALOG_EVERY_S', '10800'))
+
+
+def tsv_rows(text):
+    return list(csv.DictReader(io.StringIO(text.lstrip('\ufeff')), delimiter='\t'))
+
+
+def snapshot_catalog():
+    """Amazon's all-listings report, saved in full; gives each SKU's listing status for the Repricer page."""
+    t = now()
+    tsv = run_report('GET_MERCHANT_LISTINGS_ALL_DATA').decode('utf-8-sig', errors='replace')
+    write_once(os.path.join(DATA, 'catalog', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), [json.dumps({'taken_at': iso(t), 'tsv': tsv})])
+    rows = tsv_rows(tsv)
+    if SH:
+        _safe(SH.on_catalog, rows)
+    by = {}
+    for r in rows:
+        by[r.get('status') or '?'] = by.get(r.get('status') or '?', 0) + 1
+    with LOCK:
+        STATE['catalog'].update(last=iso(t), skus=len(rows), by_status=by, last_error=None)
 
 
 def keepa_asins():
@@ -584,6 +611,14 @@ def repricer_skus():
     return jsonify(out)
 
 
+@app.get('/repricer/table')
+def repricer_table():
+    """Every SKU (Seller Snap + Amazon's listing report) with listing state, stock, Seller Snap settings, live flag and latest decision."""
+    need_key()
+    return jsonify({'catalog_at': iso(dt.datetime.fromtimestamp(SH.catalog_t, dt.timezone.utc)) if SH.catalog_t else None,
+                    'rows': SH.table(LV.cfg.get('skus') or [])})
+
+
 @app.get('/repricer/suppressed')
 def repricer_suppressed():
     """In-stock listings with the Buy Box suppressed now, with Amazon's competitive price vs min, break-even and cost."""
@@ -674,6 +709,7 @@ def start():
     else:
         STATE['foep']['last_error'] = 'not configured'
     threading.Thread(target=every, args=('health', HEALTH_EVERY, snapshot_health, sp), daemon=True).start()
+    threading.Thread(target=delayed, args=(120, every, 'catalog', CATALOG_EVERY, snapshot_catalog, sp), daemon=True).start()
     threading.Thread(target=delayed, args=(900, every, 'keepa', KEEPA_EVERY, pull_keepa, ['KEEPA_KEY']), daemon=True).start()
     _safe(FE.load)
     STATE['fees']['skus'] = len(FE.by_sku)

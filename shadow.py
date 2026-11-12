@@ -281,6 +281,13 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered}
 
 
+def _num(v):
+    try:
+        return float(v) if v not in (None, '') else None
+    except (TypeError, ValueError):
+        return None
+
+
 def capital_return(rows):
     """Cost of waiting from Nick's own numbers: what a dollar tied up in inventory earns per day across the store.
     profit/day = sum over SKUs of 30-day units/day x Seller Snap profit per unit (ROI x cost; it already takes off fees and prep)
@@ -322,6 +329,11 @@ class Shadow:
         self.refs = {}              # asin -> (t, {CompetitivePrice, WasPrice, ...}) from the competitive summary sweep
         self.featured = {}          # asin -> (t, has a featured offer) from the same sweep
         self.sup_since = {}         # asin -> first time seen suppressed in this run
+        self.ss_rows = {}           # sku -> latest Seller Snap row (every SKU, not one per ASIN)
+        self.inv = {}               # sku -> {fulfillable, inbound, reserved, unfulfillable}
+        self.catalog = {}           # sku -> Amazon all-listings report row {asin, title, status, channel, price, qty}
+        self.catalog_t = None
+        self.fyp = {}               # sku -> (status, reason) from Amazon's suppressed-listings report
         self.pending = collections.OrderedDict()
         self.last_decided = {}
         self.model = None
@@ -395,8 +407,10 @@ class Shadow:
             out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': r['cost'],
                       'listed': r['listed_price'], 'v30': v, 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
         rate = capital_return(rows)
+        ss = {r['sku']: r for r in rows if r.get('sku')}
         with self.lock:
             self.listings = out
+            self.ss_rows = ss
             if rate:
                 self.capital_rate = rate['per_day']
                 self.stats['capital'] = rate
@@ -475,9 +489,86 @@ class Shadow:
         return sorted(out, key=lambda r: -r['inventory'])
 
     def on_inventory(self, rows):
-        m = {x['sellerSku']: ((x.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0) for x in rows}
+        m, det = {}, {}
+        for x in rows:
+            d = x.get('inventoryDetails') or {}
+            m[x['sellerSku']] = d.get('fulfillableQuantity') or 0
+            det[x['sellerSku']] = {'fulfillable': d.get('fulfillableQuantity') or 0,
+                                   'inbound': (d.get('inboundWorkingQuantity') or 0) + (d.get('inboundShippedQuantity') or 0) + (d.get('inboundReceivingQuantity') or 0),
+                                   'reserved': (d.get('reservedQuantity') or {}).get('totalReservedQuantity') or 0,
+                                   'unfulfillable': (d.get('unfulfillableQuantity') or {}).get('totalUnfulfillableQuantity') or 0}
         with self.lock:
             self.stock = m
+            self.inv = det
+
+    def on_catalog(self, rows):
+        """Amazon's all-listings report (every SKU on the account, with Active / Inactive / Incomplete)."""
+        c = {}
+        for r in rows:
+            sku = (r.get('seller-sku') or '').strip()
+            if not sku:
+                continue
+            c[sku] = {'asin': (r.get('asin1') or '').strip(), 'title': (r.get('item-name') or r.get('\ufeffitem-name') or '').strip()[:160],
+                      'status': (r.get('status') or '').strip(), 'channel': 'FBA' if (r.get('fulfillment-channel') or '').startswith('AMAZON') else 'MFN',
+                      'price': _num(r.get('price')), 'qty': _num(r.get('quantity'))}
+        with self.lock:
+            self.catalog = c
+            self.catalog_t = time.time()
+
+    def on_fyp(self, rows):
+        """Amazon's suppressed-listings report: listings Amazon hides from search (missing info, etc.)."""
+        with self.lock:
+            self.fyp = {(r.get('SKU') or r.get('sku') or '').strip(): ((r.get('Status') or '').strip(), (r.get('Reason') or '').strip())
+                        for r in rows if (r.get('SKU') or r.get('sku'))}
+
+    def listing_state(self, sku, ss=None, cat=None, inv=None):
+        """Seller Snap-style listing state: active, out_of_stock, deactivated or archived.
+        archived     no longer tracked on one side: on Amazon's listing report but not in Seller Snap, or the other way round
+        out_of_stock no sellable units
+        deactivated  sellable units, but Amazon shows the listing Inactive / Incomplete or hides it from search
+        active       sellable units and Amazon shows the listing Active"""
+        if (self.catalog and cat is None) or (self.ss_rows and ss is None):
+            return 'archived'
+        fu = (inv or {}).get('fulfillable')
+        if fu is None:
+            fu = (ss or {}).get('qty') or (cat or {}).get('qty') or 0
+        if fu <= 0:
+            return 'out_of_stock'
+        st = (cat or {}).get('status')
+        if (st and st != 'Active') or sku in self.fyp:
+            return 'deactivated'
+        return 'active'
+
+    def table(self, live_skus=()):
+        """One row per SKU (Seller Snap and Amazon's listing report together), with state, stock, Seller Snap settings and
+        the repricer's latest decision, for the Hub's Repricer page."""
+        with self.lock:
+            ss_rows, cat, inv, latest, listings = dict(self.ss_rows), dict(self.catalog), dict(self.inv), dict(self.latest), dict(self.listings)
+            refs = dict(self.refs)
+        live = set(live_skus)
+        priced = {v['sku']: a for a, v in listings.items()}
+        out = []
+        for sku in sorted(set(ss_rows) | set(cat)):
+            r, c, iv = ss_rows.get(sku), cat.get(sku), inv.get(sku)
+            asin = (r or {}).get('asin') or (c or {}).get('asin')
+            a_pr = priced.get(sku)
+            d = latest.get(a_pr) if a_pr else None
+            bb = (r or {}).get('avg_bb_share')
+            out.append({'sku': sku, 'asin': asin, 'title': (r or {}).get('title') or (c or {}).get('title'),
+                        'state': self.listing_state(sku, r, c, iv), 'amazon_status': (c or {}).get('status'), 'channel': (c or {}).get('channel'),
+                        'search_suppressed': (self.fyp.get(sku) or (None, None))[1] or None,
+                        'in_seller_snap': r is not None, 'ss_repricing': (r or {}).get('repricing'), 'preset': (r or {}).get('preset'),
+                        'price': (r or {}).get('listed_price') or (c or {}).get('price'), 'min': (r or {}).get('min_price'), 'max': (r or {}).get('max_price'),
+                        'cost': (r or {}).get('cost'), 'roi': (r or {}).get('roi'), 'bb_share': bb if bb is not None else (r or {}).get('bb_share'),
+                        'v30': (r or {}).get('v30'), 'fulfillable': (iv or {}).get('fulfillable', 0), 'inbound': (iv or {}).get('inbound', 0),
+                        'reserved': (iv or {}).get('reserved', 0), 'live': sku in live, 'priced': a_pr is not None,
+                        'priced_sku': (listings.get(asin) or {}).get('sku') if asin else None,
+                        'competitive_price': ((refs.get(asin) or (None, {}))[1] or {}).get('CompetitivePrice') if asin else None,
+                        'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'low_any', 'foep', 'gain_24h',
+                                                          'profit_day_now', 'profit_day_rec', 'suppressed', 'backordered')} if d else None})
+        # sparse: leave out empty fields (6,000 rows; most are out of stock with little to show)
+        zero_ok = ('fulfillable', 'inbound', 'reserved')   # 0 is the page default for these; elsewhere 0 means something (0% Buy Box)
+        return [{k: v for k, v in r.items() if not (v is None or v is False or v == '' or (k in zero_ok and v == 0))} for r in out]
 
     def on_foep(self, sku, body):
         try:
