@@ -1,7 +1,7 @@
-name: Retrain repricer model
+name: Retrain repricer model (manual backup)
+# The nightly retrain runs on the recorder itself (app.retrain, 3:17 AM Central). This workflow is only a manual backup;
+# it uploads the new model only if it passes the same safety check against the recorder's current model.
 on:
-  schedule:
-    - cron: '17 9 * * *'   # 3:17 AM Central (09:17 UTC), nightly
   workflow_dispatch: {}
 jobs:
   train:
@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install numpy pandas scikit-learn requests
-      - name: Train on the last 7 days and upload to the recorder
+      - name: Train on the last 7 days; upload only if it beats the current model
         env:
           RECORDER_KEY: ${{ secrets.RECORDER_KEY }}
         run: python tools/train.py --days 7 --upload --out model.json

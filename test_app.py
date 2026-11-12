@@ -183,3 +183,40 @@ def test_repricer_skus_tuning_and_log():
     assert c.get('/shadow?sku=S7', headers=h).get_json()[-1]['sku'] == 'S7'
     assert c.get('/live/log', headers=h).status_code == 200
     c.post('/live', json={'min_gain_abs': 0.5, 'decay_per_day': 0.003, 'skus': []}, headers=h)
+
+
+def test_retrain_installs_only_when_check_passes(monkeypatch):
+    import test_shadow as TS, types
+    c = A.app.test_client(); h = {'X-Recorder-Key': 'k'}
+    c.post('/model', data=json.dumps(TS.MODEL), headers=h)
+    old = A.SH.stats['model_trained_at']
+    calls = []
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        out, rep = cmd[cmd.index('--out') + 1], cmd[cmd.index('--report') + 1]
+        verdict = 'replace' if len(calls) == 1 else 'keep current'
+        json.dump({**TS.MODEL, 'trained_at': f'new{len(calls)}'}, open(out, 'w'))
+        json.dump({'verdict': verdict, 'reasons': [] if verdict == 'replace' else ['AUC 0.80 vs current 0.88'],
+                   'new': {'bb_foep': {'auc': 0.88}}, 'current': {'bb_foep': {'auc': 0.87}}}, open(rep, 'w'))
+        return types.SimpleNamespace(returncode=0, stdout='ok', stderr='')
+    monkeypatch.setattr(A.subprocess, 'run', fake_run)
+    r = A.retrain()
+    assert r['ok'] and r['installed'] and A.SH.stats['model_trained_at'] == 'new1'
+    assert '--local' in calls[0] and '--current' in calls[0] and calls[0][:3] == ['nice', '-n', '15']
+    r = A.retrain()
+    assert r['ok'] and not r['installed'] and A.SH.stats['model_trained_at'] == 'new1'      # failed the check: current model stays
+    assert A.STATE['retrain']['verdict'] == 'keep current' and A.STATE['retrain']['reasons'] == ['AUC 0.80 vs current 0.88']
+    assert c.get('/model', headers=h).get_json()['trained_at'] == 'new1'
+    monkeypatch.setattr(A.subprocess, 'run', lambda cmd, **kw: types.SimpleNamespace(returncode=1, stdout='', stderr='boom'))
+    assert not A.retrain()['ok'] and A.STATE['retrain']['state'] == 'failed' and A.SH.stats['model_trained_at'] == 'new1'
+    assert c.post('/retrain').status_code == 401
+
+
+def test_next_retrain_is_317_central():
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    t = dt.datetime(2026, 11, 12, 17, 0, tzinfo=ZoneInfo('America/Chicago')).timestamp()
+    n = dt.datetime.fromtimestamp(A.next_retrain(t), ZoneInfo('America/Chicago'))
+    assert (n.day, n.hour, n.minute) == (13, 3, 17)
+    t = dt.datetime(2026, 11, 13, 2, 0, tzinfo=ZoneInfo('America/Chicago')).timestamp()
+    assert dt.datetime.fromtimestamp(A.next_retrain(t), ZoneInfo('America/Chicago')).day == 13

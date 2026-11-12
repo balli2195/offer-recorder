@@ -16,7 +16,8 @@ Endpoints: /healthz (open); /status, /files, /files/<path> (header X-Recorder-Ke
 Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QUEUE_URL, RECORDER_KEY, SS_BOX_URL, SS_BOX_KEY,
      SPAPI_CLIENT_ID, SPAPI_CLIENT_SECRET, SPAPI_REFRESH_TOKEN, optional KEEPA_KEY, DATA_DIR (default /var/data), MIN_FREE_FRAC.
 """
-import csv, datetime as dt, gzip, hmac, io, json, logging, os, shutil, threading, time
+import csv, datetime as dt, gzip, hmac, io, json, logging, os, resource, shutil, subprocess, sys, threading, time
+from zoneinfo import ZoneInfo
 import boto3, requests
 from flask import Flask, abort, jsonify, request, send_from_directory
 
@@ -52,7 +53,9 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None},
          'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None},
          'traffic': {'last': None, 'asins': None, 'last_error': None},
-         'limits': {'last': None, 'costs': None, 'overrides': None, 'last_error': None}}
+         'limits': {'last': None, 'costs': None, 'overrides': None, 'last_error': None},
+         'retrain': {'last': None, 'state': None, 'verdict': None, 'reasons': None, 'new_auc': None, 'current_auc': None, 'seconds': None,
+                     'peak_mb': None, 'next': None, 'last_error': None}}
 # What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
 STREAMS = {
     'offers': ('Offer changes', 'continuous', 'Every Amazon offer-change message for your listings (SQS), saved raw before it leaves the queue.'),
@@ -67,6 +70,7 @@ STREAMS = {
     'catalog': ('Amazon listing status', 'every 3 h', "Amazon's all-listings report: every SKU on the account with Active / Inactive / Incomplete, so the Repricer page can show each listing's state."),
     'traffic': ('Sales & Traffic', 'daily', "Amazon's Sales & Traffic report for the last 30 days by ASIN (units ordered, Buy Box %, page views): the repricer's sales speed and Buy Box share."),
     'limits': ('Price limits from the Hub', 'hourly (pushed by the Hub)', 'Unit costs (InventoryLab, order ledger, lead cost), min/max overrides (liquidation, manual) and the limit settings, sent by the Hub.'),
+    'retrain': ('Nightly model retraining', 'daily, 3:17 AM Central', 'Refits the Buy Box, rival-reaction and price-war models on the last 7 days of recorded data, in a separate process on this server, and swaps them in only if the new Buy Box model scores at least as well as the current one on the same held-out 2 days.'),
     'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
     'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
 }
@@ -562,6 +566,99 @@ def every(name, seconds, fn, needs):
         time.sleep(max(60, seconds - (time.time() - t0)))
 
 
+RETRAIN_AT = (3, 17)          # Central time
+RETRAIN_TIMEOUT = 75 * 60
+RETRAIN_NEED_MB = int(os.environ.get('RETRAIN_NEED_MB', '420'))   # a 7-day run peaked at 340 MB (Nov 12), plus margin
+_retrain_lock = threading.Lock()
+
+
+def mem_headroom_mb():
+    """Memory left in this container (cgroup limit minus current use), or None if the limit can't be read."""
+    for lim, cur in (('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
+                     ('/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory/memory.usage_in_bytes')):
+        try:
+            mx = open(lim).read().strip()
+            if mx == 'max' or int(mx) > 1 << 50:
+                return None
+            return (int(mx) - int(open(cur).read().strip())) // 2**20
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def next_retrain(t=None):
+    ct = dt.datetime.fromtimestamp(t or time.time(), ZoneInfo('America/Chicago'))
+    nxt = ct.replace(hour=RETRAIN_AT[0], minute=RETRAIN_AT[1], second=0, microsecond=0)
+    if nxt <= ct:
+        nxt = (nxt + dt.timedelta(days=1)).replace(hour=RETRAIN_AT[0], minute=RETRAIN_AT[1])
+    return nxt.timestamp()
+
+
+def retrain():
+    """Runs tools/train.py on this server's own data in a child process (low priority, so recording and the repricer keep their CPU),
+    then installs the new model only if train.py's safety check says replace. Every run's report is saved to retrain/<month>.jsonl.gz."""
+    if not _retrain_lock.acquire(blocking=False):
+        return {'ok': False, 'error': 'already running'}
+    t0 = time.time()
+    try:
+        with LOCK:
+            STATE['retrain'].update(state='running', last_error=None)
+        mdir = os.path.join(DATA, 'model')
+        os.makedirs(mdir, exist_ok=True)
+        cand, rep, cur = os.path.join(mdir, 'candidate.json'), os.path.join(mdir, 'retrain_report.json'), SH.model_path()
+        for f in (cand, rep):
+            if os.path.exists(f):
+                os.remove(f)
+        room = mem_headroom_mb()
+        if room is not None and room < RETRAIN_NEED_MB:
+            raise RuntimeError(f'not enough memory to train: {room} MB free in the container, a run needs about {RETRAIN_NEED_MB} MB')
+        cap = (room - 64) * 2**20 if room else None
+
+        def limit():   # the child gets a memory error instead of the container being killed
+            if cap:
+                resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
+        cmd = ['nice', '-n', '15', sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'train.py'),
+               '--local', DATA, '--days', '7', '--out', cand, '--report', rep] + (['--current', cur] if os.path.exists(cur) else [])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=RETRAIN_TIMEOUT, preexec_fn=limit)
+        peak = round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024)
+        tail = (r.stdout or '')[-3000:] + (r.stderr or '')[-2000:]
+        if r.returncode != 0 or not os.path.exists(rep):
+            raise RuntimeError(f'train.py exit {r.returncode}: {tail[-600:]}')
+        report = json.load(open(rep))
+        installed = False
+        if report.get('verdict') == 'replace':
+            SH.save_model(open(cand).read())
+            installed = True
+        rec = {'taken_at': iso(), 'seconds': round(time.time() - t0), 'peak_mb': peak, 'installed': installed, **report, 'log_tail': tail[-1500:]}
+        append_gz(os.path.join(DATA, 'retrain', now().strftime('%Y-%m') + '.jsonl.gz'), [json.dumps(rec)])
+        with LOCK:
+            STATE['retrain'].update(last=iso(), state='done', last_error=None, verdict=report.get('verdict'), reasons=report.get('reasons'),
+                                    new_auc=((report.get('new') or {}).get('bb_foep') or {}).get('auc'),
+                                    current_auc=((report.get('current') or {}).get('bb_foep') or {}).get('auc'),
+                                    seconds=rec['seconds'], peak_mb=peak, installed=installed)
+        return {'ok': True, **rec}
+    except Exception as e:
+        log.exception('retrain')
+        with LOCK:
+            STATE['retrain'].update(state='failed', last_error=f'{iso()} {type(e).__name__}: {str(e)[:300]}', seconds=round(time.time() - t0))
+        try:
+            append_gz(os.path.join(DATA, 'retrain', now().strftime('%Y-%m') + '.jsonl.gz'), [json.dumps({'taken_at': iso(), 'error': str(e)[:2000]})])
+        except OSError:
+            pass
+        return {'ok': False, 'error': str(e)[:300]}
+    finally:
+        _retrain_lock.release()
+
+
+def retrain_loop():
+    while True:
+        nxt = next_retrain()
+        with LOCK:
+            STATE['retrain']['next'] = iso(dt.datetime.fromtimestamp(nxt, dt.timezone.utc))
+        time.sleep(max(30, nxt - time.time()))
+        retrain()
+
+
 def delayed(seconds, fn, *args):
     """Keepa waits for the first inventory and Seller Snap snapshots, so it knows which ASINs are in stock."""
     time.sleep(seconds)
@@ -591,6 +688,7 @@ def status():
                            suppressed_now=sum(1 for d in list(SH.latest.values()) if d.get('suppressed')))
         s['live'] = dict(LV.stats, env_live_mode=os.environ.get('LIVE_MODE', 'off'), config={k: (v if k != 'skus' else len(v)) for k, v in LV.cfg.items()})
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
+    s['memory'] = {'free_mb': mem_headroom_mb(), 'retrain_needs_mb': RETRAIN_NEED_MB}
     return jsonify(s)
 
 
@@ -610,6 +708,25 @@ def files():
 def file_get(p):
     need_key()
     return send_from_directory(DATA, p, as_attachment=True)
+
+
+@app.get('/model')
+def model_get():
+    need_key()
+    try:
+        return send_from_directory(os.path.dirname(SH.model_path()), 'model.json')
+    except Exception:
+        abort(404)
+
+
+@app.post('/retrain')
+def retrain_now():
+    """Runs the nightly retraining now, in the background. GET /status -> retrain shows the result."""
+    need_key()
+    if _retrain_lock.locked():
+        return jsonify({'ok': False, 'error': 'already running'}), 409
+    threading.Thread(target=retrain, daemon=True).start()
+    return jsonify({'ok': True, 'started': iso()})
 
 
 @app.post('/model')
@@ -748,6 +865,7 @@ def start():
     os.makedirs(DATA, exist_ok=True)
     STATE['started'] = iso()
     threading.Thread(target=SH.loop, daemon=True).start()
+    threading.Thread(target=retrain_loop, daemon=True).start()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
     threading.Thread(target=segments_loop, daemon=True).start()
