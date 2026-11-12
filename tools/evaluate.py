@@ -10,7 +10,14 @@ U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=3); A = ap.parse_args()
 cut = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=A.days)).strftime('%Y-%m-%d')
 F = requests.get(U + '/files', headers=H, timeout=60).json()
-get = lambda p: gzip.open(io.BytesIO(requests.get(U + '/files/' + p, headers=H, timeout=300).content), 'rt').read().splitlines()
+def get(p):
+    for k in range(4):
+        try:
+            return gzip.open(io.BytesIO(requests.get(U + '/files/' + p, headers=H, timeout=300).content), 'rt').read().splitlines()
+        except (OSError, EOFError, requests.RequestException):
+            continue
+    print('skipped unreadable file', p)
+    return []
 pick = lambda k: [f['path'] for f in F if f['path'].startswith(k + '/') and f['path'].split('/')[1][:10] >= cut]
 ts_ = lambda s: dt.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
 D = pd.DataFrame([json.loads(l) for p in pick('shadow') for l in get(p)])

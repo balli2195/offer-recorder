@@ -35,7 +35,8 @@ def get(path):
             return gzip.open(io.BytesIO(b), 'rt').read().splitlines()
         except Exception as e:
             err = e
-    raise err
+    print('skipped unreadable file', path, err, flush=True)
+    return []
 def want(kind):
     return [f['path'] for f in files if f['path'].startswith(kind + '/') and f['path'].split('/')[1][:10] >= cut]
 # ---------------- offers
