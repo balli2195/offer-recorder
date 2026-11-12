@@ -2,7 +2,8 @@
 Four loops write gzip JSONL to the Render disk:
   offers/   every ANY_OFFER_CHANGED message from SQS, raw (saved to disk before it is deleted from the queue)
   listings/ Seller Snap listing snapshot, hourly, through the Seller Snap box (read action only)
-  segments/ Amazon's Featured Offer breakdown (competitive summary) for every in-stock ASIN, one call per 31 s, about 15 min a sweep
+  segments/ Amazon's Featured Offer breakdown and reference prices (competitive summary: CompetitivePrice = the outside price above
+            which Amazon suppresses the Buy Box, WasPrice) for every in-stock ASIN, one call per 31 s, about 15 min a sweep
   orders/   Amazon all-orders report, daily, last 8 days, with customer location columns removed
   inventory/ Amazon FBA inventory summaries (fulfillable, reserved, inbound, unfulfillable), hourly, every SKU with any quantity
   foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
@@ -50,7 +51,7 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
 # What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
 STREAMS = {
     'offers': ('Offer changes', 'continuous', 'Every Amazon offer-change message for your listings (SQS), saved raw before it leaves the queue.'),
-    'segments': ('Buy Box segments', 'a sweep about every 15 min', "Amazon's featured-offer breakdown by customer segment for every in-stock ASIN."),
+    'segments': ('Buy Box segments and reference prices', 'a sweep about every 15 min', "Amazon's featured-offer breakdown by customer segment, and its reference prices (the competitive price that decides Buy Box suppression, and the was price), for every in-stock ASIN."),
     'listings': ('Seller Snap snapshot', 'hourly', 'Min, max, price, cost, ROI, sales speed and Buy Box share for every SKU, read through the Seller Snap box.'),
     'orders': ('Orders', 'daily', 'Last 8 days of the all-orders report, customer location removed.'),
     'inventory': ('FBA inventory', 'hourly', 'Fulfillable, reserved, inbound and unfulfillable units for every SKU with stock.'),
@@ -211,7 +212,7 @@ def pull_fees():
 
 def segment_batch(asins, token):
     """One competitive summary call for up to 20 ASINs. Saves each ASIN's raw response. Returns False if Amazon throttled us."""
-    b = {'requests': [{'asin': a, 'marketplaceId': MP, 'includedData': ['featuredBuyingOptions'], 'method': 'GET',
+    b = {'requests': [{'asin': a, 'marketplaceId': MP, 'includedData': ['featuredBuyingOptions', 'referencePrices'], 'method': 'GET',
                        'uri': '/products/pricing/2022-05-01/items/competitiveSummary'} for a in asins]}
     r = requests.post(f'{SP}/batches/products/pricing/2022-05-01/items/competitiveSummary',
                       headers={'x-amz-access-token': token, 'content-type': 'application/json'}, json=b, timeout=60)
@@ -225,6 +226,8 @@ def segment_batch(asins, token):
     for a, x in zip(asins, r.json().get('responses') or []):
         body = x.get('body') or {}
         lines.append(json.dumps({'taken_at': iso(t), 'asin': body.get('asin') or a, 'status': (x.get('status') or {}).get('statusCode'), 'body': body}))
+        if SH and body:
+            _safe(SH.on_competitive_summary, body.get('asin') or a, body)
     append_gz(os.path.join(DATA, 'segments', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
     with LOCK:
         STATE['segments']['saved'] += len(lines)
@@ -577,8 +580,15 @@ def repricer_skus():
         d = SH.latest.get(asin) or {}
         out.append({'asin': asin, 'sku': s['sku'], 'title': s.get('title'), 'min': s['min'], 'max': s['max'], 'cost': s['cost'], 'qty': s.get('qty'),
                     'ss_repricing': s.get('ss_repricing'), 'live': s['sku'] in live_set, 'fulfillable': SH.stock.get(s['sku']),
-                    'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'low_any', 'foep', 'gain_24h', 'winner', 'suppressed')} if d else None})
+                    'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'low_any', 'foep', 'gain_24h', 'winner', 'suppressed', 'backordered')} if d else None})
     return jsonify(out)
+
+
+@app.get('/repricer/suppressed')
+def repricer_suppressed():
+    """In-stock listings with the Buy Box suppressed now, with Amazon's competitive price vs min, break-even and cost."""
+    need_key()
+    return jsonify(SH.suppressed_list())
 
 
 @app.get('/live/log')

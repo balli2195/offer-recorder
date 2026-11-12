@@ -48,11 +48,14 @@ for pth in want('offers'):
         seen.add(d['message_id'])
         p = json.loads(d['body'])['Payload']['AnyOfferChangedNotification']
         t = ts_(p['OfferChangeTrigger']['TimeOfOfferChange'])
-        off = [(o['SellerId'], o['ListingPrice']['Amount'] + o['Shipping']['Amount'], bool(o.get('IsBuyBoxWinner'))) for o in p['Offers'] if o.get('SubCondition') == 'new' and o.get('IsFulfilledByAmazon')]
-        by[p['OfferChangeTrigger']['ASIN']].append((t, off, S.suppression(p)[0]))
+        # FBA new offers available now, plus Nick's own whatever its availability (same rule as shadow.fba_offers)
+        off = [(o['SellerId'], o['ListingPrice']['Amount'] + o['Shipping']['Amount'], bool(o.get('IsBuyBoxWinner'))) for o in p['Offers']
+               if o.get('SubCondition') == 'new' and o.get('IsFulfilledByAmazon') and (o.get('SellerId') == ME or not S.backordered(o))]
+        me_bo = any(o.get('SellerId') == ME and S.backordered(o) for o in p['Offers'])
+        by[p['OfferChangeTrigger']['ASIN']].append((t, off, S.suppression(p)[0] or me_bo))
 print('messages', len(seen), 'asins', len(by), flush=True)
 IDX = {}
-SUPP = {}   # per message: Buy Box suppressed (no Buy Box shown); those moments are left out of the Buy Box model
+SUPP = {}   # per message: Buy Box suppressed (no Buy Box shown) or Nick's offer backordered; those moments are left out of the Buy Box model
 for a, ms in by.items():
     ms.sort(key=lambda x: x[0])
     IDX[a] = (np.array([m[0] for m in ms]), [{s: p for s, p, w in off} for t, off, _ in ms], [{s for s, p, w in off if w} for t, off, _ in ms])

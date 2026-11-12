@@ -193,3 +193,31 @@ def test_shadow_marks_suppressed_from_messages(tmp_path):
                                                                                            lowest=[('Amazon', 52.8), ('Merchant', 48.0)])}})])
     d = sh.decide_one('A1')
     assert d['suppressed'] and d['rec_price'] == 48.0
+
+
+def test_backordered_rivals_ignored_and_own_backorder_blocks_cuts():
+    n = {'OfferChangeTrigger': {'ASIN': 'A1'}, 'Offers': [
+        {'SellerId': S.ME, 'SubCondition': 'new', 'IsFulfilledByAmazon': True, 'ListingPrice': {'Amount': 30.0}, 'Shipping': {'Amount': 0}, 'ShippingTime': {'AvailabilityType': 'NOW'}},
+        {'SellerId': 'BO', 'SubCondition': 'new', 'IsFulfilledByAmazon': True, 'ListingPrice': {'Amount': 25.0}, 'Shipping': {'Amount': 0}, 'ShippingTime': {'AvailabilityType': 'FUTURE_WITH_DATE'}},
+        {'SellerId': 'OK', 'SubCondition': 'new', 'IsFulfilledByAmazon': True, 'ListingPrice': {'Amount': 30.5}, 'Shipping': {'Amount': 0}, 'ShippingTime': {'AvailabilityType': 'NOW'}, 'IsBuyBoxWinner': True}]}
+    offs, win, me_bo, n_bo = S.fba_offers(n)
+    assert offs == {S.ME: 30.0, 'OK': 30.5} and win == 'OK' and me_bo is False and n_bo == 1
+    d = S.decide(MODEL, 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', SKU, foep=29.0, foep_age=60, me_backordered=True)
+    assert d['rec_price'] >= 30.5 and d['backordered'] and any('backordered' in r for r in d['reasons'])
+    e = S.decide(MODEL, 'A1', {S.ME: 52.8}, None, dict(SKU, min=25, max=60, v30=0.4), suppressed=True, low_any=48.0, me_backordered=True)
+    assert e['action'] == 'hold' and e['rec_price'] == 52.8
+
+
+def test_suppressed_list(tmp_path):
+    sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda: 'now')
+    sh.on_listings([{'sku': 'S1', 'asin': 'A1', 'min_price': 42.16, 'max_price': 54.11, 'listed_price': 52.8, 'cost': 25.0, 'roi': -5, 'v30': 0.2, 'qty': 24},
+                    {'sku': 'S2', 'asin': 'A2', 'min_price': 20, 'max_price': 40, 'listed_price': 30, 'cost': 10.0, 'roi': 30, 'v30': 1, 'qty': 5}])
+    sh.on_fees({'S1': {'t': time.time(), 'bands': BANDS}})
+    sh.on_competitive_summary('A1', {'featuredBuyingOptions': [{'segmentedFeaturedOffers': []}],
+                                     'referencePrices': [{'name': 'CompetitivePrice', 'price': {'amount': 29.0}}, {'name': 'WasPrice', 'price': {'amount': 41.46}}]})
+    sh.on_competitive_summary('A2', {'featuredBuyingOptions': [{'segmentedFeaturedOffers': [{'sellerId': S.ME}]}], 'referencePrices': []})
+    L = sh.suppressed_list()
+    assert [r['asin'] for r in L] == ['A1']
+    r = L[0]
+    assert r['competitive_price'] == 29.0 and r['was_price'] == 41.46 and r['status'].startswith('below your break-even')
+    assert r['breakeven'] and abs(S.margin(r['breakeven'], dict(SKU, cost=25.0, fees=BANDS))) < 0.05 and r['inventory'] == round(24 * (25 + S.PREP), 2)

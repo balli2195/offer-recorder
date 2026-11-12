@@ -86,6 +86,36 @@ def war_penalty_pct(model, rate):
     return tab[-1][1]
 
 
+def backordered(o):
+    """An FBA offer Amazon shows as not yet available ("FUTURE_WITH_DATE": units inbound, in transfer or reserved).
+    Nov 12 check: at the listing low, such offers held the Buy Box 13.1% of the time vs 32.7% for offers available now;
+    Nick's own backordered offers 1% vs 25%."""
+    return ((o.get('ShippingTime') or {}).get('AvailabilityType') or 'NOW') != 'NOW'
+
+
+def fba_offers(n):
+    """({seller: landed price} for FBA new offers available now, plus Nick's own offer whatever its availability,
+    Buy Box winner of any fulfillment, Nick backordered?, number of backordered rival FBA offers left out).
+    Backordered rivals are left out of the competition (and the 'lowest rival') because they rarely win the Buy Box:
+    matching them would only push the price down. The same rule is used in tools/train.py."""
+    offs, win, me_bo, n_bo = {}, None, False, 0
+    for o in n.get('Offers') or []:
+        if o.get('SubCondition') != 'new':
+            continue
+        if o.get('IsBuyBoxWinner'):
+            win = o['SellerId']          # any fulfillment: a merchant-fulfilled offer can hold the Buy Box too
+        if not o.get('IsFulfilledByAmazon'):
+            continue
+        bo = backordered(o)
+        if o.get('SellerId') == ME:
+            me_bo = bo
+        elif bo:
+            n_bo += 1
+            continue
+        offs[o['SellerId']] = (o.get('ListingPrice') or {}).get('Amount', 0) + (o.get('Shipping') or {}).get('Amount', 0)
+    return offs, win, me_bo, n_bo
+
+
 def suppression(n):
     """(suppressed, lowest new offer landed price, its channel) from one ANY_OFFER_CHANGED notification.
     Suppressed = Amazon shows no Buy Box: no Buy Box price in the summary and no offer marked winner (Nov 12 check: 211 of 214
@@ -102,7 +132,7 @@ def suppression(n):
     return sup, lo[0], lo[1]
 
 
-def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None):
+def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None, me_backordered=False):
     """Buy Box suppressed (Nick, Nov 12 2026): don't chase Amazon's target price; match the lowest offer on the listing
     (any fulfillment, landed price), within min/max, and let the usual step limits and brakes work from there."""
     me = offers[ME]
@@ -110,6 +140,8 @@ def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None):
     if not (lo and hi) or lo > hi or not low_any:
         return None
     rec = round(clip(low_any, lo, hi), 2)
+    if me_backordered and rec < me:   # like Seller Snap: no cuts until the stock is available
+        rec = me
     change = abs(rec - me) >= 0.01
     action = 'hold' if not change else ('match_low' if rec < me else 'raise')
     daily = min(float(qty or 0), max(sku.get('v30') or 0.0, 0.0))   # recent sales pace; the Buy Box model doesn't apply here
@@ -121,6 +153,8 @@ def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None):
     cur, best = row(me), row(rec)
     ch = 'FBA' if low_ch == 'Amazon' else 'merchant-fulfilled' if low_ch == 'Merchant' else ''
     reasons = [f'Buy Box suppressed: matching the lowest offer {low_any:.2f}' + (f' ({ch})' if ch else '')]
+    if me_backordered:
+        reasons.append('your offer is backordered: no cuts until the stock is available')
     if low_any < lo - 0.005:
         reasons.append(f'lowest offer is below your min {lo:.2f}')
     if low_any > hi + 0.005:
@@ -132,13 +166,13 @@ def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None):
     return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': min(rivals.values()) if rivals else None, 'low_any': low_any,
             'n_rivals': len(rivals), 'winner': None, 'suppressed': True, 'foep': None, 'rec_price': rec if change else me, 'qty': qty,
             'days_to_sell': round(qty / daily, 1) if daily > 0 and qty else None, 'v_future': None, 'action': action, 'gain_24h': None,
-            'cur': cur, 'best': best if change else cur, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(sku['lam'], 4),
+            'cur': cur, 'best': best if change else cur, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(sku['lam'], 4), 'backordered': me_backordered,
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': (best if change else cur)['profit_24h'], 'roi_now': cur['roi'],
             'roi_rec': (best if change else cur)['roi'], 'fees_src': fees_src, 'decay': None}
 
 
 def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None,
-           suppressed=False, low_any=None, low_ch=None):
+           suppressed=False, low_any=None, low_ch=None, me_backordered=False, rivals_backordered=0):
     """offers: {seller: landed price} for FBA new offers on the listing; winner: Buy Box seller id or None.
     sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None.
     suppressed: Amazon shows no Buy Box on the listing; then the price matches the lowest offer instead (decide_suppressed)."""
@@ -146,7 +180,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         return None
     if suppressed:
         qty = my_stock if my_stock is not None else (sku.get('qty') or 0)
-        return decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune)
+        return decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune, me_backordered)
     if len(offers) < 2:
         return None
     me = offers[ME]
@@ -172,6 +206,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if me <= low - 0.005:  # Nick alone at the low: the next offer minus a cent is a raise candidate
         cands |= {round(low - 0.01, 2)}
     cands = sorted({round(clip(c, lo, hi), 2) for c in cands})
+    if me_backordered:   # Nick's units aren't available yet: don't compete on price (no cuts), as Seller Snap does; raises still allowed
+        cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
     lam = sku['lam']
     rate = max((rival_info(model, s)[0] for s in near), default=model['rival_default']['rate'])
     lag = min((rival_info(model, s)[1] for s in near), default=model['rival_default']['lag_min'])
@@ -230,6 +266,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         reasons.append(f'stock share {share:.0%}')
     if lo > low:
         reasons.append('floor above lowest rival')
+    if me_backordered:
+        reasons.append('your offer is backordered: no cuts until the stock is available')
+    if rivals_backordered:
+        reasons.append(f'{rivals_backordered} backordered rival offer{"s" if rivals_backordered > 1 else ""} ignored')
     fees_src = 'amazon' if sku.get('fees') and _fees.fee_at(sku['fees'], me) else 'estimate'
     if fees_src != 'amazon':
         reasons.append("fees estimated (Amazon's fee for this SKU not loaded yet)")
@@ -238,7 +278,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
-            'fees_src': fees_src, 'decay': round(decay, 5)}
+            'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered}
 
 
 def capital_return(rows):
@@ -279,6 +319,9 @@ class Shadow:
         self.fees = {}              # sku -> {'t', 'bands'} from Amazon's fee estimates
         self.fba_median = FALLBACK_FBA
         self.capital_rate = None    # profit per day / money tied up in inventory (cost + prep, on hand and inbound)
+        self.refs = {}              # asin -> (t, {CompetitivePrice, WasPrice, ...}) from the competitive summary sweep
+        self.featured = {}          # asin -> (t, has a featured offer) from the same sweep
+        self.sup_since = {}         # asin -> first time seen suppressed in this run
         self.pending = collections.OrderedDict()
         self.last_decided = {}
         self.model = None
@@ -326,18 +369,11 @@ class Shadow:
             except Exception:
                 continue
             a = p['OfferChangeTrigger']['ASIN']
-            offs = {}
-            win = None
-            for o in p.get('Offers') or []:
-                if o.get('SubCondition') == 'new' and o.get('IsBuyBoxWinner'):
-                    win = o['SellerId']          # any fulfillment: a merchant-fulfilled offer can hold the Buy Box too
-                if o.get('SubCondition') != 'new' or not o.get('IsFulfilledByAmazon'):
-                    continue
-                pr = (o.get('ListingPrice') or {}).get('Amount', 0) + (o.get('Shipping') or {}).get('Amount', 0)
-                offs[o['SellerId']] = pr
+            offs, win, me_bo, n_bo = fba_offers(p)
             sup, low_any, low_ch = suppression(p)
             with self.lock:
-                self.offers[a] = (time.time(), offs, win, {'suppressed': sup, 'low_any': low_any, 'low_ch': low_ch})
+                self.offers[a] = (time.time(), offs, win, {'suppressed': sup, 'low_any': low_any, 'low_ch': low_ch,
+                                                           'me_backordered': me_bo, 'rivals_backordered': n_bo})
                 if ME in offs:
                     self.pending[a] = True
                     self.pending.move_to_end(a)
@@ -372,6 +408,71 @@ class Shadow:
             if f:
                 self.fba_median = statistics.median(f)
             self.stats['fees_known'] = len(by_sku)
+
+    def on_competitive_summary(self, asin, body):
+        """One ASIN's competitive summary (segments sweep): reference prices and whether any featured offer exists."""
+        refs = {x.get('name'): (x.get('price') or {}).get('amount') for x in body.get('referencePrices') or [] if x.get('name')}
+        has = any(s_.get('sellerId') for o in body.get('featuredBuyingOptions') or [] for s_ in o.get('segmentedFeaturedOffers') or [])
+        now = time.time()
+        with self.lock:
+            if refs:
+                self.refs[asin] = (now, refs)
+            if 'featuredBuyingOptions' in body:
+                self.featured[asin] = (now, has)
+                if not has:
+                    self.sup_since.setdefault(asin, now)
+                else:
+                    self.sup_since.pop(asin, None)
+
+    def breakeven(self, sku):
+        """Lowest price (to the cent) at which a unit sold makes no loss after Amazon fees, cost and prep."""
+        p = round(max(sku['cost'] * 0.5, 0.5), 2)
+        hi = sku['cost'] * 4 + 40
+        while p < hi:
+            if margin(p, sku) >= 0:
+                return round(p, 2)
+            p = round(p + 0.01, 2) if p < 12 else round(p * 1.002 + 0.01, 2)
+        return None
+
+    def suppressed_list(self):
+        """Listings with the Buy Box suppressed now (latest sweep shows no featured offer, or the latest offer-change
+        message says so), with what it would take to get it back."""
+        now = time.time()
+        with self.lock:
+            ids = {a for a, (t, has) in self.featured.items() if not has and now - t < 3 * 3600}
+            ids |= {a for a, d in self.latest.items() if d.get('suppressed') and (a not in self.featured or not self.featured[a][1])}
+            items = [(a, self.listings.get(a), self.latest.get(a), self.refs.get(a), self.sup_since.get(a)) for a in ids]
+            fees_by, stock, foep, fba_med = dict(self.fees), dict(self.stock), dict(self.foep), self.fba_median
+        out = []
+        for a, sku, d, rf, since in items:
+            if not sku:
+                continue
+            sk = dict(sku, fees=(fees_by.get(sku['sku']) or {}).get('bands'), fixed_fee=fba_med)
+            qty = stock.get(sku['sku'])
+            qty = qty if qty is not None else (sku.get('qty') or 0)
+            if not qty:
+                continue
+            refs = (rf or (None, {}))[1]
+            cp = refs.get('CompetitivePrice')
+            fo = foep.get(sku['sku'])
+            target = fo[1] if fo and now - fo[0] < 3 * 3600 else None
+            be = self.breakeven(sk)
+            bar = cp if cp is not None else target
+            if bar is None:
+                status = 'no competitive price from Amazon yet'
+            elif sku['min'] and bar >= sku['min'] - 0.005:
+                status = 'at or above your min: the repricer can win it back'
+            elif be is not None and bar >= be:
+                status = 'below your min, still profitable: lower the min to win it back'
+            else:
+                status = 'below your break-even: wait for it to rise, or liquidate'
+            out.append({'asin': a, 'sku': sku['sku'], 'title': sku.get('title'), 'my_price': (d or {}).get('my_price') or sku.get('listed'),
+                        'low_any': (d or {}).get('low_any'), 'competitive_price': cp, 'was_price': refs.get('WasPrice'), 'target': target,
+                        'min': sku['min'], 'max': sku['max'], 'cost': sku['cost'], 'breakeven': be, 'qty': qty,
+                        'inventory': round(qty * (sku['cost'] + PREP), 2), 'sales_per_day': sku.get('v30'), 'status': status,
+                        'since': dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') if since else None,
+                        'decision': {k: (d or {}).get(k) for k in ('t', 'action', 'rec_price', 'backordered')} if d else None})
+        return sorted(out, key=lambda r: -r['inventory'])
 
     def on_inventory(self, rows):
         m = {x['sellerSku']: ((x.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0) for x in rows}
@@ -428,7 +529,8 @@ class Shadow:
         if tune.get('decay_auto', True) and crate:
             tune['decay_per_day'] = crate
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
-                      suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'))
+                      suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'),
+                      me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0))
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""

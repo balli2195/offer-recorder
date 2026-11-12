@@ -66,7 +66,7 @@ def test_segments_sweep_batches_saves_and_backs_off(monkeypatch):
     calls = []; waits = []
     def post(url, headers, json, timeout):
         calls.append([r['asin'] for r in json['requests']])
-        assert all(r['includedData'] == ['featuredBuyingOptions'] for r in json['requests'])
+        assert all(r['includedData'] == ['featuredBuyingOptions', 'referencePrices'] for r in json['requests'])
         if len(calls) == 2: return R(429)
         return R(200, {'responses': [{'status': {'statusCode': 200}, 'body': {'asin': r['asin'], 'featuredBuyingOptions': []}} for r in json['requests']]})
     monkeypatch.setattr(A.requests, 'post', post)
