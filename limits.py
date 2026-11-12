@@ -4,7 +4,8 @@
         order-ledger average (last 12 months) -> latest lead cost (by ASIN). Seller Snap's cost only if none of those has it.
   min   a Hub override (liquidation min Nick approved, or a manual min), else the lowest price where
         (price - Amazon fees - cost - prep) / cost >= min ROI (12%), with Amazon's exact fees for the SKU.
-  max   a Hub override, else the higher of the highest lowest-FBA price in the past year (Keepa) and 1.25 x min;
+  max   a Hub override, else the higher of the year high (Keepa: the higher of the lowest-FBA price and the Buy Box price over
+        the past year) and 1.25 x min;
         with under 90 days of FBA history, 2 x min. At decision time it is raised to a rival's Buy Box price above it.
   sales Amazon Sales & Traffic: units ordered and Buy Box % over the last 30 days, by ASIN.
 """
@@ -62,39 +63,51 @@ def rule_min(cost, bands, prep, min_roi, fallback_fba=4.11):
     return None
 
 
-def fba_year_high(product, now_min=None):
-    """(highest lowest-FBA price in the past 365 days, days of FBA history in that year) from a Keepa product with
-    offers and a year of history (csv[10] = lowest new FBA price). None when the product has no FBA history."""
-    csv = product.get('csv') or []
-    c = csv[10] if len(csv) > 10 else None
-    if not c or len(c) < 4:
-        return None
-    t_last = c[-2]
-    now_min = now_min or t_last
-    start = now_min - 365 * 1440
-    hi, span = None, 0
-    prev_t, prev_v = None, None
-    for i in range(0, len(c) - 1, 2):
-        t, v = c[i], c[i + 1]
+def _year_high(c, step, start, now_min):
+    """(highest price, minutes with a price) over [start, now] in a Keepa price series. step 2 = (time, price);
+    step 3 = (time, price, shipping), as in the Buy Box series."""
+    hi, span, prev_t, prev_v = None, 0, None, None
+    pts = [(c[i], (c[i + 1] + max(c[i + 2], 0)) if step == 3 and c[i + 1] > 0 else c[i + 1]) for i in range(0, len(c) - step + 1, step)]
+    for t, v in pts + [(now_min, None)]:
         if prev_t is not None and prev_v is not None and prev_v > 0:
             a, b = max(prev_t, start), min(t, now_min)
             if b > a:
                 span += b - a
                 hi = max(hi or 0, prev_v)
         prev_t, prev_v = t, v
-    if prev_v is not None and prev_v > 0 and now_min > max(prev_t, start):
-        span += now_min - max(prev_t, start)
-        hi = max(hi or 0, prev_v)
-    if not hi:
+    return hi, span
+
+
+def fba_year_high(product, now_min=None):
+    """(year high, days of price history, highest lowest-FBA price, highest Buy Box price) over the past 365 days, from a Keepa
+    product pulled with offers and a year of history (csv[10] = lowest new FBA price, csv[18] = Buy Box price + shipping).
+    The year high is the higher of the two: the lowest-FBA price misses times an FBM seller or Amazon held the Buy Box above
+    every FBA offer (Nov 12 check: 7 of 28 restocking SKUs). None when the product has neither."""
+    csv = product.get('csv') or []
+    f = csv[10] if len(csv) > 10 and csv[10] and len(csv[10]) >= 4 else None
+    b = csv[18] if len(csv) > 18 and csv[18] and len(csv[18]) >= 6 else None
+    if not f and not b:
         return None
-    return round(hi / 100.0, 2), round(span / 1440.0, 1)
+    now_min = now_min or max(x[-3 if x is b else -2] for x in (f, b) if x)
+    start = now_min - 365 * 1440
+    fh, fs = _year_high(f, 2, start, now_min) if f else (None, 0)
+    bh, bs = _year_high(b, 3, start, now_min) if b else (None, 0)
+    if not fh and not bh:
+        return None
+    r = lambda v: round(v / 100.0, 2) if v else None
+    return r(max(fh or 0, bh or 0)), round(max(fs, bs) / 1440.0, 1), r(fh), r(bh)
 
 
 def resolve_max(min_price, year_high, settings):
     """(max, source)."""
     if not min_price:
         return None, None
-    hi, days = (year_high or (None, 0))
+    yh = tuple(year_high or (None, 0))
+    hi, days = yh[0], yh[1]
+    fh, bh = (yh[2], yh[3]) if len(yh) >= 4 else (hi, None)
+    floor = settings.get('max_floor_mult', 1.25) * min_price
     if hi and days >= settings.get('max_history_days', 90):
-        return round(max(hi, settings.get('max_floor_mult', 1.25) * min_price), 2), 'year-high FBA price' if hi >= settings.get('max_floor_mult', 1.25) * min_price else '1.25 x min'
+        if hi < floor:
+            return round(floor, 2), '1.25 x min'
+        return round(hi, 2), 'year-high Buy Box price' if bh and bh >= hi and (not fh or bh > fh) else 'year-high FBA price'
     return round(settings.get('max_new_mult', 2.0) * min_price, 2), '2 x min (short FBA history)'

@@ -476,8 +476,8 @@ class Shadow:
             if not asin:
                 continue
             fu = (iv or {}).get('fulfillable')
-            if fu is None:
-                fu = (r or {}).get('qty') or 0
+            if fu is None:   # Seller Snap's count only before Amazon's inventory has loaded: it lags, and kept 7 empty inactive SKUs priced on Nov 12
+                fu = 0 if (inv and cat) else ((r or {}).get('qty') or 0)
             tot = fu + (iv or {}).get('reserved', 0) + (iv or {}).get('inbound', 0)
             if tot <= 0:
                 continue
@@ -521,7 +521,8 @@ class Shadow:
                          'qty': iv.get('fulfillable', r.get('qty')), 'ss_repricing': bool(r.get('repricing')) if r else False,
                          'src': {'cost': csrc, 'min': nsrc, 'max': xsrc, 'sales': dsrc},
                          'ss_min': r.get('min_price'), 'ss_max': r.get('max_price'), 'ss_cost': r.get('cost'),
-                         'year_high': (fh.get(asin) or (None, None))[0], 'year_days': (fh.get(asin) or (None, None))[1]}
+                         'year_high': (fh.get(asin) or (None, None))[0], 'year_days': (fh.get(asin) or (None, None))[1],
+                         'year_fba_high': (tuple(fh.get(asin) or ()) + (None,) * 4)[2], 'year_bb_high': (tuple(fh.get(asin) or ()) + (None,) * 4)[3]}
         rate = self.own_capital_return(out, inv, cat, costs, fees_by, fba_med) if (tr and costs) else capital_return(list(ss.values()))
         with self.lock:
             self.listings = out
@@ -565,7 +566,8 @@ class Shadow:
             d_min.append(dm); d_max.append(dx)
             rows.append({'asin': a, 'sku': x['sku'], 'title': x['title'], 'min': x['min'], 'ss_min': x['ss_min'], 'min_diff': round(dm, 4),
                          'max': x['max'], 'ss_max': x['ss_max'], 'max_diff': round(dx, 4), 'cost': x['cost'], 'ss_cost': x.get('ss_cost'),
-                         'src': x['src'], 'year_high': x.get('year_high'), 'year_days': x.get('year_days')})
+                         'src': x['src'], 'year_high': x.get('year_high'), 'year_days': x.get('year_days'),
+                         'year_fba_high': x.get('year_fba_high'), 'year_bb_high': x.get('year_bb_high')})
         q = lambda v, k: sorted(v)[int(k * (len(v) - 1))] if v else None
         summ = {'compared': len(rows), 'min_within_5pct': sum(1 for v in d_min if abs(v) <= 0.05), 'max_within_5pct': sum(1 for v in d_max if abs(v) <= 0.05),
                 'min_diff_median': q(d_min, .5), 'max_diff_median': q(d_max, .5)}
@@ -747,9 +749,11 @@ class Shadow:
     def on_keepa_products(self, products):
         highs = {}
         for p in products or []:
-            c = (p.get('csv') or [None] * 11)
-            c = c[10] if len(c) > 10 else None
-            if c and len(c) >= 4 and (c[-2] - c[0]) > 30 * 1440:   # only a pull with a long history (the daily year pull)
+            cs = p.get('csv') or []
+            f, b = (cs[10] if len(cs) > 10 else None), (cs[18] if len(cs) > 18 else None)
+            long_f = bool(f and len(f) >= 4 and f[-2] - f[0] > 30 * 1440)
+            long_b = bool(b and len(b) >= 6 and b[-3] - b[0] > 30 * 1440)
+            if long_f or long_b:   # only a pull with a long history (the daily year pull)
                 h = L.fba_year_high(p, now_min=int(time.time() / 60) - L.KEEPA_EPOCH_MIN)
                 if h:
                     highs[p['asin']] = h

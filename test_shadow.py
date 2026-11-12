@@ -260,12 +260,21 @@ def test_rule_min_hits_12pct_and_cost_order():
 def test_year_high_and_max_rule():
     now = 10_000_000
     c = [now - 400 * 1440, 5000, now - 300 * 1440, 4200, now - 100 * 1440, -1, now - 50 * 1440, 3900]
-    hi, days = LM.fba_year_high({'csv': [None] * 10 + [c]}, now_min=now)
-    assert hi == 50.0 and 310 < days < 320          # $50 carried into the year window; the 50-day -1 gap does not count
+    hi, days, fh, bh = LM.fba_year_high({'csv': [None] * 10 + [c]}, now_min=now)
+    assert hi == 50.0 == fh and bh is None and 310 < days < 320          # $50 carried into the year window; the 50-day -1 gap does not count
+    # Buy Box (price + shipping) above every FBA offer for a while: it sets the year high
+    bb = [now - 200 * 1440, 5500, 499, now - 150 * 1440, 4000, 0]
+    hi, days, fh, bh = LM.fba_year_high({'csv': [None] * 10 + [c] + [None] * 7 + [bb]}, now_min=now)
+    assert (hi, fh, bh) == (59.99, 50.0, 59.99)
+    # Buy Box history only (no FBA offer all year)
+    hi, days, fh, bh = LM.fba_year_high({'csv': [None] * 18 + [bb]}, now_min=now)
+    assert (hi, fh, bh) == (59.99, None, 59.99) and 199 < days < 201
     st = {'max_floor_mult': 1.25, 'max_new_mult': 2.0, 'max_history_days': 90}
     assert LM.resolve_max(30.0, (50.0, 250), st)[0] == 50.0
     assert LM.resolve_max(45.0, (50.0, 250), st)[0] == 56.25      # floor 1.25 x min
     assert LM.resolve_max(30.0, (50.0, 20), st)[0] == 60.0        # short history: 2 x min
+    assert LM.resolve_max(30.0, (59.99, 250, 50.0, 59.99), st) == (59.99, 'year-high Buy Box price')
+    assert LM.resolve_max(30.0, (50.0, 250, 50.0, 41.0), st) == (50.0, 'year-high FBA price')
 
 
 def test_rebuild_from_own_data_and_bb_raise(tmp_path):
