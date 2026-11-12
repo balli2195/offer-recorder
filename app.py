@@ -46,6 +46,7 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'health': {'last': None, 'account_status': None, 'suppressed_rows': None, 'last_error': None},
          'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None}}
 LOCK = threading.Lock()
+import shadow as _shadow, live as _live
 IN_STOCK = []  # ASINs with FBA stock, from the latest Seller Snap snapshot
 SELLABLE = []  # (sku, asin) with fulfillable quantity > 0, from the latest inventory snapshot
 
@@ -81,10 +82,20 @@ def write_once(path, lines):
     os.replace(tmp, path)
 
 
+def _safe(fn, *a):
+    """Shadow/live hooks never interrupt recording."""
+    try:
+        return fn(*a)
+    except Exception:
+        log.exception('shadow hook')
+
+
 def save_batch(msgs):
     t = now()
     lines = [json.dumps({'received_at': iso(t), 'message_id': m['MessageId'], 'sent_ms': (m.get('Attributes') or {}).get('SentTimestamp'), 'body': m['Body']}) for m in msgs]
     append_gz(os.path.join(DATA, 'offers', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
+    if SH:
+        _safe(SH.on_message_bodies, [m['Body'] for m in msgs])
 
 
 def poll_once(sqs):
@@ -147,6 +158,9 @@ def snapshot_listings():
     line = json.dumps({'taken_at': iso(t), 'exportedAt': res.get('exportedAt'), 'rows': rows})
     append_gz(os.path.join(DATA, 'listings', t.strftime('%Y-%m-%d') + '.jsonl.gz'), [line])
     asins = sorted({r['asin'] for r in rows if r.get('asin') and (r.get('qty') or 0) > 0})
+    if SH:
+        _safe(SH.on_listings, rows)
+        _safe(LV.on_listings, rows)
     global IN_STOCK
     with LOCK:
         IN_STOCK = asins
@@ -158,6 +172,11 @@ def sp_token():
                       'client_id': os.environ['SPAPI_CLIENT_ID'], 'client_secret': os.environ['SPAPI_CLIENT_SECRET']}, timeout=30)
     r.raise_for_status()
     return r.json()['access_token']
+
+
+SH = _shadow.Shadow(DATA, append_gz, iso)
+LV = _live.Live(DATA, append_gz, iso, sp_token)
+SH.on_decision = LV.maybe_apply
 
 
 def segment_batch(asins, token):
@@ -309,6 +328,8 @@ def snapshot_inventory(wait=time.sleep):
         wait(0.6)  # limit is 2 requests/second
     append_gz(os.path.join(DATA, 'inventory', t.strftime('%Y-%m-%d') + '.jsonl.gz'), [json.dumps({'taken_at': iso(t), 'skus_seen': seen, 'rows': rows})])
     sell = sorted({(x['sellerSku'], x.get('asin')) for x in rows if ((x.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0) > 0})
+    if SH:
+        _safe(SH.on_inventory, rows)
     global SELLABLE
     with LOCK:
         SELLABLE = sell
@@ -329,6 +350,9 @@ def foep_batch(skus, token):
     lines = [json.dumps({'taken_at': iso(t), 'sku': s, 'status': (x.get('status') or {}).get('statusCode'), 'body': x.get('body')})
              for s, x in zip(skus, r.json().get('responses') or [])]
     append_gz(os.path.join(DATA, 'foep', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
+    if SH:
+        for s_, x in zip(skus, r.json().get('responses') or []):
+            _safe(SH.on_foep, s_, x.get('body') or {})
     with LOCK:
         STATE['foep']['saved'] += len(lines)
     return True
@@ -418,6 +442,8 @@ def pull_keepa(wait=time.sleep):
             continue
         used += j.get('tokensConsumed') or 0
         append_gz(path, [json.dumps({'taken_at': iso(), 'asins': b, 'tokensConsumed': j.get('tokensConsumed'), 'tokensLeft': j.get('tokensLeft'), 'response': j})])
+        if SH:
+            _safe(SH.on_keepa_products, j.get('products'))
         with LOCK:
             STATE['keepa'].update(tokens_used=used, tokens_left=j.get('tokensLeft'))
     with LOCK:
@@ -465,6 +491,9 @@ def status():
     with LOCK:
         s = json.loads(json.dumps(STATE))
     s['status_pid'] = os.getpid()
+    if SH:
+        s['shadow'] = dict(SH.stats, asins_tracked=len(SH.offers), skus_priced=len(SH.listings), foep_known=len(SH.foep), rival_stock_known=len(SH.rival_stock))
+        s['live'] = dict(LV.stats, env_live_mode=os.environ.get('LIVE_MODE', 'off'), config={k: (v if k != 'skus' else len(v)) for k, v in LV.cfg.items()})
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
     return jsonify(s)
 
@@ -487,6 +516,52 @@ def file_get(p):
     return send_from_directory(DATA, p, as_attachment=True)
 
 
+@app.post('/model')
+def model_upload():
+    need_key()
+    try:
+        SH.save_model(request.get_data(as_text=True))
+    except (ValueError, KeyError) as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    return jsonify({'ok': True, 'trained_at': SH.stats['model_trained_at']})
+
+
+@app.get('/shadow')
+def shadow_recent():
+    need_key()
+    n = int(request.args.get('n', 50))
+    act = request.args.get('action')
+    rows = [d for d in list(SH.recent) if not act or d['action'] == act]
+    return jsonify(rows[-n:])
+
+
+@app.get('/live')
+def live_get():
+    need_key()
+    return jsonify({'env_live_mode': os.environ.get('LIVE_MODE', 'off'), 'config': LV.cfg, 'stats': LV.stats})
+
+
+@app.post('/live')
+def live_set():
+    need_key()
+    return jsonify({'ok': True, 'config': LV.set_cfg(request.get_json(force=True) or {})})
+
+
+@app.post('/live/stop')
+def live_stop():
+    need_key()
+    return jsonify({'ok': True, 'config': LV.stop()})
+
+
+@app.post('/live/preview')
+def live_preview():
+    """Amazon validates a price change for one SKU without applying it (VALIDATION_PREVIEW). Never changes a price."""
+    need_key()
+    b = request.get_json(force=True) or {}
+    code, resp, body = LV.send(str(b['sku']), float(b['price']), preview=True)
+    return jsonify({'status_code': code, 'response': resp, 'sent': body})
+
+
 _started = False
 
 
@@ -499,6 +574,7 @@ def start():
     _started = True
     os.makedirs(DATA, exist_ok=True)
     STATE['started'] = iso()
+    threading.Thread(target=SH.loop, daemon=True).start()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
     threading.Thread(target=segments_loop, daemon=True).start()

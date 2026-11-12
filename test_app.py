@@ -154,3 +154,18 @@ def test_keepa_batches_saves_and_respects_reserve(monkeypatch):
     files = [os.path.join(r, x) for r, _, ns in os.walk(os.path.join(A.DATA, 'keepa')) for x in ns]
     rows = read(files[0]); assert len(rows) == 2 and rows[0]['response']['products'][0]['asin'] == 'A000'
     assert A.STATE['keepa']['tokens_used'] == 334 and A.STATE['keepa']['asins'] == 31
+
+def test_shadow_endpoints_and_feed():
+    import test_shadow as TS
+    c = A.app.test_client(); h = {'X-Recorder-Key': 'k'}
+    assert c.post('/model', data='{}', headers=h).status_code == 400  # malformed model is rejected
+    r = c.post('/model', data=json.dumps(TS.MODEL), headers=h); assert r.status_code == 200 and r.get_json()['trained_at'] == 'test'
+    A.SH.on_listings([{'sku': 'S1', 'asin': 'A9', 'min_price': 25, 'max_price': 40, 'listed_price': 30, 'cost': 15, 'roi': 30, 'v30': 2, 'avg_bb_share': 50, 'repricing': True, 'qty': 5}])
+    A.save_batch([{'MessageId': 'm1', 'Body': TS.body('A9', [(A._shadow.ME, 29.5, True), ('CALM', 30.4, False)])}])
+    assert 'A9' in A.SH.pending
+    A.SH.step()
+    rows = c.get('/shadow?n=5', headers=h).get_json(); assert rows and rows[-1]['asin'] == 'A9' and rows[-1]['live'] is None
+    st = c.get('/status', headers=h).get_json(); assert st['shadow']['decisions'] >= 1 and st['live']['env_live_mode'] in ('off', 'on')
+    r = c.post('/live', json={'enabled': True, 'skus': ['S1']}, headers=h).get_json(); assert r['config']['enabled'] is True
+    assert c.post('/live/stop', headers=h).get_json()['config']['enabled'] is False
+    assert c.post('/live', json={}).status_code == 401
