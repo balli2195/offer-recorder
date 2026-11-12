@@ -568,7 +568,7 @@ def every(name, seconds, fn, needs):
 
 RETRAIN_AT = (3, 17)          # Central time
 RETRAIN_TIMEOUT = 75 * 60
-RETRAIN_NEED_MB = int(os.environ.get('RETRAIN_NEED_MB', '420'))   # a 7-day run peaked at 340 MB (Nov 12), plus margin
+RETRAIN_NEED_MB = int(os.environ.get('RETRAIN_NEED_MB', '300'))   # a 7-day run peaked at 340 MB locally (Nov 12); the child is capped at the free memory, so a tight run fails on its own
 _retrain_lock = threading.Lock()
 
 
