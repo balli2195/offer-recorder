@@ -1,4 +1,4 @@
-"""Offer recorder (Nick, Nov 2026). Read-only: records what Seller Snap and the market do. It cannot change prices.
+"""Offer recorder and repricer (Nick, Nov 2026): records what Seller Snap and the market do, and runs your repricer (shadow decisions always; price changes only for live SKUs once switched on).
 Four loops write gzip JSONL to the Render disk:
   offers/   every ANY_OFFER_CHANGED message from SQS, raw (saved to disk before it is deleted from the queue)
   listings/ Seller Snap listing snapshot, hourly, through the Seller Snap box (read action only)
