@@ -196,6 +196,9 @@ class Shadow:
                 m = json.load(f)
             self.model = m
             self.stats['model_trained_at'] = m.get('trained_at')
+            self.stats['model_info'] = {'validation': m.get('validation'), 'bb_rows': m.get('bb_rows'), 'messages': m.get('messages'),
+                                        'window_days': m.get('window_days'), 'rivals': len(m.get('rivals') or {}), 'rival_default': m.get('rival_default'),
+                                        'war_table': m.get('war_table')}
         except FileNotFoundError:
             self.model = None
         except Exception as e:

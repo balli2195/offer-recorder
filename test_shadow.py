@@ -69,7 +69,7 @@ def test_shadow_feeds_and_logs(tmp_path):
     sh = S.Shadow(str(tmp_path), lambda path, lines: written.append((path, lines)), lambda: '2026-11-12T00:00:00Z')
     assert sh.model is None
     sh.save_model(json.dumps(MODEL))
-    assert sh.model['trained_at'] == 'test'
+    assert sh.model['trained_at'] == 'test' and sh.stats['model_info']['rivals'] == 2
     sh.on_listings([{'sku': 'S1', 'asin': 'A1', 'min_price': 25, 'max_price': 40, 'listed_price': 30, 'cost': 15, 'roi': 30, 'v30': 2, 'avg_bb_share': 50, 'repricing': True, 'qty': 5}])
     sh.on_inventory([{'sellerSku': 'S1', 'inventoryDetails': {'fulfillableQuantity': 5}}])
     sh.on_foep('S1', {'featuredOfferExpectedPriceResults': [{'resultStatus': 'VALID_FOEP', 'featuredOfferExpectedPrice': {'listingPrice': {'amount': 30.1}}}]})
