@@ -1,0 +1,24 @@
+name: Retrain repricer model
+on:
+  schedule:
+    - cron: '17 9 * * *'   # 3:17 AM Central (09:17 UTC), nightly
+  workflow_dispatch: {}
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy pandas scikit-learn requests
+      - name: Train on the last 7 days and upload to the recorder
+        env:
+          RECORDER_KEY: ${{ secrets.RECORDER_KEY }}
+        run: python tools/train.py --days 7 --upload --out model.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: model.json
+          retention-days: 30
