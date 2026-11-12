@@ -7,9 +7,11 @@ Inputs (kept in memory, fed by the recorder's existing loops):
   inventory  fulfillable quantity per SKU
   foep       Amazon's featured offer expected price per SKU, with its time
   keepa      rival FBA stock per ASIN (latest Keepa pull)
+  fees       Amazon's own fee estimate per SKU at a price in each fee band (fees.py)
 Model: model.json written by tools/train.py (Buy Box logistic models, per-rival reaction rates, price-war penalty table).
 """
-import json, math, os, threading, time, collections, datetime as dt
+import json, math, os, statistics, threading, time, collections, datetime as dt
+import fees as _fees
 
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
@@ -18,6 +20,8 @@ MIN_GAIN_ABS = 0.50      # $/day of expected profit before a change is recommend
 MIN_GAIN_REL = 0.05      # or 5 %
 DEBOUNCE_S = 120         # at most one decision per ASIN every 2 minutes
 DECAY_PER_DAY = float(os.environ.get('SHADOW_DECAY_PER_DAY', '0.003'))  # cost of waiting to sell, as a share of price per day
+PREP = float(os.environ.get('PREP_FEE', '1.40'))   # Nick's prep cost per unit, on every SKU (also in Seller Snap's ROI)
+FALLBACK_FBA = 4.11  # only until Amazon's fee for a SKU is loaded (median FBA fee in the Nov 12 sample)
 
 
 # ---------------------------------------------------------------- features (shared with tools/train.py)
@@ -49,13 +53,18 @@ def p_win(model, x):
 
 # ---------------------------------------------------------------- economics
 def fee(p, sku):
+    """Amazon's fee at price p: from Amazon's own estimates when loaded (sku['fees'] = bands), else 8%/15% referral + a typical FBA fee."""
+    x = _fees.fee_at(sku.get('fees'), p)
+    if x:
+        return x
     ref = 0.08 if p <= 10 else 0.15
-    return ref * p + sku['fixed_fee'], ref
+    return ref * p + (sku.get('fixed_fee') or FALLBACK_FBA), ref
 
 
 def margin(p, sku):
+    """Profit per unit sold at p: price - Amazon fees - cost - prep (Seller Snap's profit; ROI = this / cost)."""
     f, _ = fee(p, sku)
-    return p - f - sku['cost']
+    return p - f - sku['cost'] - PREP
 
 
 def rival_info(model, seller):
@@ -115,8 +124,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     days_to_sell = min(qty / max(daily_now, 0.05), 180.0)
     # What is already paid for is sunk: a unit sold now is worth its net proceeds; a unit kept is worth selling it later
     # near today's market low, less the cost of waiting (capital, storage, price erosion) over about half the sell-through time.
-    ref_low = 0.08 if low <= 10 else 0.15
-    v_future = (low - (ref_low * low + sku['fixed_fee'])) * (1.0 - decay * days_to_sell / 2.0)
+    f_low, ref_low = fee(low, sku)
+    v_future = (low - f_low) * (1.0 - decay * days_to_sell / 2.0)
     exposed = min(qty, max(daily_now, 0.05) * 30.0)   # units whose future value a price war would lower
     rows = []
     for p in cands:
@@ -133,8 +142,9 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             pw = pw_alone
         units = min(lam * HORIZON_H * pw, qty)
         ev = units * ((p - f_p) - v_future) - pen
-        rows.append({'price': p, 'p_win': round(pw, 4), 'units_24h': round(units, 3), 'margin': round(m, 2),
-                     'roi': round(m / sku['cost'], 4) if sku['cost'] else None, 'penalty': round(pen, 2), 'exp_value_24h': round(ev, 2)})
+        rows.append({'price': p, 'p_win': round(pw, 4), 'units_24h': round(units, 3), 'fees': round(f_p, 2), 'margin': round(m, 2),
+                     'roi': round(m / sku['cost'], 4) if sku['cost'] else None, 'profit_24h': round(units * m, 2),
+                     'penalty': round(pen, 2), 'exp_value_24h': round(ev, 2)})
     cur = min(rows, key=lambda r: abs(r['price'] - me))
     best = max(rows, key=lambda r: r['exp_value_24h'])
     gain = best['exp_value_24h'] - cur['exp_value_24h']
@@ -162,9 +172,40 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         reasons.append(f'stock share {share:.0%}')
     if lo > low:
         reasons.append('floor above lowest rival')
+    fees_src = 'amazon' if sku.get('fees') and _fees.fee_at(sku['fees'], me) else 'estimate'
+    if fees_src != 'amazon':
+        reasons.append("fees estimated (Amazon's fee for this SKU not loaded yet)")
+    rec_row = best if change else cur
     return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': low, 'n_rivals': n_riv, 'winner': winner,
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
-            'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4)}
+            'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
+            'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
+            'fees_src': fees_src, 'decay': round(decay, 5)}
+
+
+def capital_return(rows):
+    """Cost of waiting from Nick's own numbers: what a dollar tied up in inventory earns per day across the store.
+    profit/day = sum over SKUs of 30-day units/day x Seller Snap profit per unit (ROI x cost; it already takes off fees and prep)
+    capital    = sum of (on hand + inbound) x (cost + prep)
+    A sale delayed by a day costs about this share of its proceeds, because that cash would otherwise be back in inventory earning it."""
+    last = {}
+    for r in rows:
+        if r.get('sku'):
+            last[r['sku']] = r
+    prof = cap = cogs = 0.0
+    for r in last.values():
+        c = r.get('cost') or 0.0
+        if c <= 0:
+            continue
+        v = r.get('v30') or 0.0
+        if r.get('roi') is not None:
+            prof += v * r['roi'] / 100.0 * c
+        cap += ((r.get('qty') or 0) + (r.get('inbound') or 0)) * (c + PREP)
+        cogs += v * (c + PREP)
+    if cap <= 0 or cogs <= 0:
+        return None
+    return {'per_day': round(clip(prof / cap, 0.0005, 0.02), 5), 'profit_per_day': round(prof, 2), 'capital': round(cap, 2),
+            'days_of_stock': round(cap / cogs, 1), 'roi_per_turn': round(prof / cogs, 4)}
 
 
 # ---------------------------------------------------------------- live state and loop (used by app.py)
@@ -177,6 +218,9 @@ class Shadow:
         self.stock = {}             # sku -> fulfillable
         self.foep = {}              # sku -> (t, value)
         self.rival_stock = {}       # asin -> (t, units of competitive rivals)
+        self.fees = {}              # sku -> {'t', 'bands'} from Amazon's fee estimates
+        self.fba_median = FALLBACK_FBA
+        self.capital_rate = None    # profit per day / money tied up in inventory (cost + prep, on hand and inbound)
         self.pending = collections.OrderedDict()
         self.last_decided = {}
         self.model = None
@@ -250,16 +294,25 @@ class Shadow:
             by[a] = r
         out = {}
         for a, r in by.items():
-            lp, cost, roi = r['listed_price'], r['cost'], r.get('roi')
-            ref = 0.08 if lp <= 10 else 0.15
-            fees = lp - cost - (roi / 100.0 * cost) if roi is not None else 0.35 * lp
             v = r.get('v30') or 0.0
             bbs = r.get('avg_bb_share') if r.get('avg_bb_share') is not None else r.get('bb_share')
             bbs = clip((bbs or 25.0) / 100.0, 0.25, 1.0)  # conservative: at most 4x current sales if Nick won every Buy Box
-            out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': cost,
-                      'fixed_fee': max(0.0, fees - ref * lp), 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
+            out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': r['cost'],
+                      'listed': r['listed_price'], 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
+        rate = capital_return(rows)
         with self.lock:
             self.listings = out
+            if rate:
+                self.capital_rate = rate['per_day']
+                self.stats['capital'] = rate
+
+    def on_fees(self, by_sku):
+        f = [b['bands']['mid']['fba'] for b in by_sku.values() if (b.get('bands') or {}).get('mid')]
+        with self.lock:
+            self.fees = by_sku
+            if f:
+                self.fba_median = statistics.median(f)
+            self.stats['fees_known'] = len(by_sku)
 
     def on_inventory(self, rows):
         m = {x['sellerSku']: ((x.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0) for x in rows}
@@ -303,14 +356,18 @@ class Shadow:
             sku = self.listings.get(asin)
             if not o or not sku or not self.model:
                 return None
+            sku = dict(sku, fees=(self.fees.get(sku['sku']) or {}).get('bands'), fixed_fee=self.fba_median)
             fo = self.foep.get(sku['sku'])
+            crate = self.capital_rate
             st = self.stock.get(sku['sku'])
             rs = self.rival_stock.get(asin)
             model = self.model
         t, offs, win = o
         foep, age = (fo[1], time.time() - fo[0]) if fo else (None, None)
         rstock = rs[1] if (rs and time.time() - rs[0] < 8 * 3600) else None
-        tune = self.tune_fn() if self.tune_fn else None
+        tune = dict(self.tune_fn() or {}) if self.tune_fn else {}
+        if tune.get('decay_auto', True) and crate:
+            tune['decay_per_day'] = crate
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune)
 
     def step(self):

@@ -8,6 +8,7 @@ Four loops write gzip JSONL to the Render disk:
   foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
   health/   daily seller performance report (account status, metrics) and suppressed-listings report
   keepa/    Keepa live offers with stock for in-stock ASINs, every 6 h, full responses (needs KEEPA_KEY)
+  fees/     Amazon's fee estimate (Product Fees API) for every sellable SKU at a price in each fee band; daily per SKU, full responses
 Endpoints: /healthz (open); /status, /files, /files/<path> (header X-Recorder-Key).
 Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QUEUE_URL, RECORDER_KEY, SS_BOX_URL, SS_BOX_KEY,
      SPAPI_CLIENT_ID, SPAPI_CLIENT_SECRET, SPAPI_REFRESH_TOKEN, optional KEEPA_KEY, DATA_DIR (default /var/data), MIN_FREE_FRAC.
@@ -44,9 +45,24 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'inventory': {'last': None, 'skus': None, 'sellable_skus': None, 'last_error': None},
          'foep': {'sweeps': 0, 'last_sweep': None, 'skus': None, 'saved': 0, 'throttled': 0, 'last_error': None},
          'health': {'last': None, 'account_status': None, 'suppressed_rows': None, 'last_error': None},
-         'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None}}
+         'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None},
+         'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None}}
+# What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
+STREAMS = {
+    'offers': ('Offer changes', 'continuous', 'Every Amazon offer-change message for your listings (SQS), saved raw before it leaves the queue.'),
+    'segments': ('Buy Box segments', 'a sweep about every 15 min', "Amazon's featured-offer breakdown by customer segment for every in-stock ASIN."),
+    'listings': ('Seller Snap snapshot', 'hourly', 'Min, max, price, cost, ROI, sales speed and Buy Box share for every SKU, read through the Seller Snap box.'),
+    'orders': ('Orders', 'daily', 'Last 8 days of the all-orders report, customer location removed.'),
+    'inventory': ('FBA inventory', 'hourly', 'Fulfillable, reserved, inbound and unfulfillable units for every SKU with stock.'),
+    'foep': ('Buy Box target price', 'every 30 min', "Amazon's featured offer expected price (the Buy Box target) for every sellable SKU."),
+    'health': ('Account health', 'daily', 'Seller performance report and suppressed listings.'),
+    'keepa': ('Keepa rival stock', 'every 6 h', 'Live offers with stock for in-stock ASINs, full Keepa responses.'),
+    'fees': ('Amazon fees', 'daily per SKU, hourly for new SKUs', "Amazon's own fee estimate for every sellable SKU at a price under $10, $10-$50 and over $50, used by the repricer."),
+    'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
+    'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
+}
 LOCK = threading.Lock()
-import shadow as _shadow, live as _live
+import shadow as _shadow, live as _live, fees as _fees
 IN_STOCK = []  # ASINs with FBA stock, from the latest Seller Snap snapshot
 SELLABLE = []  # (sku, asin) with fulfillable quantity > 0, from the latest inventory snapshot
 
@@ -178,6 +194,19 @@ SH = _shadow.Shadow(DATA, append_gz, iso)
 LV = _live.Live(DATA, append_gz, iso, sp_token)
 SH.on_decision = LV.maybe_apply
 SH.tune_fn = lambda: LV.cfg
+FE = _fees.Fees(DATA, append_gz, iso, sp_token, on_fees=SH.on_fees)
+FEES_EVERY = int(os.environ.get('FEES_EVERY_S', '3600'))
+
+
+def pull_fees():
+    """Amazon fee estimates for sellable SKUs that are new or over a day old (fees.py)."""
+    with LOCK:
+        sell = list(SELLABLE)
+    by_asin = dict(SH.listings)
+    todo = [(s, (by_asin.get(a) or {}).get('listed')) for s, a in sell]
+    n = FE.pull(todo)
+    with LOCK:
+        STATE['fees'].update(FE.stats, refreshed=n, sellable=len(todo))
 
 
 def segment_batch(asins, token):
@@ -493,7 +522,8 @@ def status():
         s = json.loads(json.dumps(STATE))
     s['status_pid'] = os.getpid()
     if SH:
-        s['shadow'] = dict(SH.stats, asins_tracked=len(SH.offers), skus_priced=len(SH.listings), foep_known=len(SH.foep), rival_stock_known=len(SH.rival_stock))
+        s['shadow'] = dict(SH.stats, asins_tracked=len(SH.offers), skus_priced=len(SH.listings), foep_known=len(SH.foep), rival_stock_known=len(SH.rival_stock),
+                           fees_known=len(SH.fees), capital_rate=SH.capital_rate)
         s['live'] = dict(LV.stats, env_live_mode=os.environ.get('LIVE_MODE', 'off'), config={k: (v if k != 'skus' else len(v)) for k, v in LV.cfg.items()})
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
     return jsonify(s)
@@ -574,6 +604,31 @@ def live_stop():
     return jsonify({'ok': True, 'config': LV.stop()})
 
 
+@app.post('/live/unfreeze')
+def live_unfreeze():
+    """Lets a SKU that the chase brake paused take price cuts again."""
+    need_key()
+    b = request.get_json(force=True) or {}
+    return jsonify({'ok': True, 'frozen': LV.unfreeze(str(b['sku']))})
+
+
+@app.get('/components')
+def components():
+    """Each recording stream and repricer part with what it does, how often, when it last ran and its last error (Hub system map)."""
+    need_key()
+    with LOCK:
+        st = json.loads(json.dumps(STATE))
+    st['shadow'] = {'last': SH.stats.get('last_decision'), 'last_error': SH.stats.get('last_error')}
+    st['live'] = {'last': LV.stats.get('last_applied'), 'last_error': LV.stats.get('last_error'),
+                  'state': 'on' if (LV.env_on() and LV.cfg.get('enabled') and LV.cfg.get('skus')) else 'off'}
+    out = []
+    for k, (name, when, what) in STREAMS.items():
+        x = st.get(k) or {}
+        out.append({'id': k, 'name': name, 'when': when, 'what': what, 'state': x.get('state'),
+                    'last': x.get('last') or x.get('last_saved') or x.get('last_sweep'), 'last_error': x.get('last_error')})
+    return jsonify({'service': 'offer-recorder', 'started': STATE['started'], 'what': __doc__.split('\n')[0], 'components': out})
+
+
 @app.post('/live/preview')
 def live_preview():
     """Amazon validates a price change for one SKU without applying it (VALIDATION_PREVIEW). Never changes a price."""
@@ -609,3 +664,6 @@ def start():
         STATE['foep']['last_error'] = 'not configured'
     threading.Thread(target=every, args=('health', HEALTH_EVERY, snapshot_health, sp), daemon=True).start()
     threading.Thread(target=delayed, args=(900, every, 'keepa', KEEPA_EVERY, pull_keepa, ['KEEPA_KEY']), daemon=True).start()
+    _safe(FE.load)
+    STATE['fees']['skus'] = len(FE.by_sku)
+    threading.Thread(target=delayed, args=(240, every, 'fees', FEES_EVERY, pull_fees, sp), daemon=True).start()  # after the first inventory and Seller Snap snapshots

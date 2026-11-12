@@ -87,3 +87,66 @@ def test_no_penalty_for_staying_where_already_below():
     d = S.decide(MODEL, 'A1', {S.ME: 29.0, 'REACT': 30.0}, S.ME, SKU, foep=29.5, foep_age=60)
     cur = d['cur']
     assert cur['price'] == 29.0 and cur['penalty'] == 0.0
+
+
+import fees as F
+
+BANDS = {'lo': {'price': 9.99, 'ref': 0.80, 'fba': 3.26, 'close': 0.0}, 'mid': {'price': 30.0, 'ref': 4.50, 'fba': 4.11, 'close': 0.0},
+         'hi': {'price': 59.99, 'ref': 9.00, 'fba': 4.38, 'close': 0.0}}
+
+
+def test_fee_bands_and_ten_dollar_step():
+    assert abs(F.fee_at(BANDS, 9.99)[0] - (0.08 * 9.99 + 3.26)) < 1e-9
+    assert abs(F.fee_at(BANDS, 10.00)[0] - (0.08 * 10.00 + 4.11)) < 1e-9    # referral 8% at $10.00, FBA already in the $10-$50 band
+    assert abs(F.fee_at(BANDS, 10.01)[0] - (0.15 * 10.01 + 4.11)) < 1e-9
+    assert abs(F.fee_at(BANDS, 50.00)[0] - (0.15 * 50 + 4.11)) < 1e-9
+    assert abs(F.fee_at(BANDS, 50.01)[0] - (0.15 * 50.01 + 4.38)) < 1e-9
+    assert F.fee_at({}, 20) is None and F.fee_at({'lo': BANDS['lo']}, 20) is None
+
+
+def test_band_prices():
+    assert F.band_prices(31.0) == {'lo': 9.99, 'mid': 31.0, 'hi': 59.99}
+    assert F.band_prices(86.87) == {'lo': 9.99, 'mid': 49.99, 'hi': 86.87}
+    assert F.band_prices(7.5)['mid'] == 10.01
+
+
+def test_decision_uses_amazon_fees_prep_and_reports_profit():
+    sku = dict(SKU, fees=BANDS)
+    d = S.decide(MODEL, 'A1', {S.ME: 29.50, 'CALM': 30.40}, S.ME, sku, foep=30.10, foep_age=60)
+    assert d['fees_src'] == 'amazon' and "fees estimated" not in ' '.join(d['reasons'])
+    c = d['cur']
+    assert abs(c['margin'] - round(29.50 - (0.15 * 29.50 + 4.11) - 15.0 - S.PREP, 2)) < 0.011
+    assert abs(d['profit_day_now'] - c['profit_24h']) < 1e-9 and d['roi_now'] == c['roi']
+    e = S.decide(MODEL, 'A1', {S.ME: 29.50, 'CALM': 30.40}, S.ME, SKU, foep=30.10, foep_age=60)
+    assert e['fees_src'] == 'estimate' and any('fees estimated' in r for r in e['reasons'])
+
+
+def test_capital_return():
+    rows = [{'sku': 'A', 'cost': 10.0, 'roi': 20.0, 'v30': 1.0, 'qty': 30, 'inbound': 0},
+            {'sku': 'B', 'cost': 20.0, 'roi': -10.0, 'v30': 0.5, 'qty': 10, 'inbound': 5}]
+    r = S.capital_return(rows)
+    prof = 1.0 * 0.2 * 10 + 0.5 * -0.1 * 20          # 2.0 - 1.0 = 1.0 per day
+    cap = 30 * 11.4 + 15 * 21.4                      # 342 + 321 = 663
+    assert abs(r['per_day'] - round(prof / cap, 5)) < 1e-9 and r['capital'] == round(cap, 2)
+
+
+def test_fees_pull_saves_and_feeds(tmp_path):
+    written, fed = [], []
+    fe = F.Fees(str(tmp_path), lambda p, lines: written.append((p, lines)), lambda: 'now', lambda: 'tok', on_fees=fed.append, wait=lambda s: None)
+    def fake(reqs, token):
+        return [{'Status': 'Success', 'FeesEstimateIdentifier': {'SellerInputIdentifier': f'{s}|{b}', 'PriceToEstimateFees': {'ListingPrice': {'Amount': p}}},
+                 'FeesEstimate': {'TotalFeesEstimate': {'Amount': 1}, 'FeeDetailList': [{'FeeType': 'ReferralFee', 'FinalFee': {'Amount': 0.15 * p}},
+                                                                                       {'FeeType': 'FBAFees', 'FinalFee': {'Amount': 4.0}}]}} for s, b, p in reqs]
+    fe.call = fake
+    assert fe.pull([('S1', 31.0), ('S2', 80.0)]) == 2
+    assert set(fe.by_sku['S1']['bands']) == {'lo', 'mid', 'hi'} and fed and '/fees/' in written[0][0]
+    assert fe.pull([('S1', 31.0)]) == 0               # fresh: not due
+    # reload from what was written
+    import gzip as _gz
+    os.makedirs(tmp_path / 'fees', exist_ok=True)
+    with _gz.open(tmp_path / 'fees' / (time.strftime('%Y-%m-%d', time.gmtime()) + '.jsonl.gz'), 'wt') as f:
+        for _, lines in written:
+            f.write('\n'.join(lines) + '\n')
+    fe2 = F.Fees(str(tmp_path), None, None, None)
+    fe2.load()
+    assert set(fe2.by_sku) == {'S1', 'S2'}

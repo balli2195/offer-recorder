@@ -81,3 +81,75 @@ def test_stop(tmp_path):
     assert lv.stop()['enabled'] is False
     lv2, _ = mk(tmp_path)          # persisted
     assert lv2.cfg['enabled'] is False and lv2.cfg['skus'] == ['S1']
+
+
+CUT = {'sku': 'S1', 'asin': 'A1', 'action': 'undercut', 'my_price': 30.0, 'rec_price': 29.0, 'low_rival': 30.0, 'min': 20.0, 'max': 40.0, 'gain_24h': 1.0, 'reasons': []}
+
+
+def live_ready(tmp_path, **cfg):
+    lv, logs = mk(tmp_path)
+    lv.set_cfg(dict({'enabled': True, 'skus': ['S1'], 'min_interval_s': 120}, **cfg))
+    lv.on_listings([{'sku': 'S1', 'repricing': False}])
+    lv.send = lambda sku, price, preview=False: (200, {'status': 'ACCEPTED'}, {})
+    return lv, logs
+
+
+def test_chased_cuts_pause_cuts_but_not_raises(tmp_path):
+    lv, _ = live_ready(tmp_path, chase_cuts=2, chase_window_min=30, max_drop_pct=50)
+    t = time.time()
+    lv.maybe_apply(dict(CUT))                                   # cut 30 -> 29
+    lv.observe(dict(CUT, my_price=29.0, low_rival=29.0), t + 300)  # a rival matched within 5 min
+    assert lv.streak['S1'] == 1 and 'S1' not in lv.frozen
+    lv.last_change['S1'] = t - 1000
+    lv.maybe_apply(dict(CUT, my_price=29.0, rec_price=28.0, low_rival=29.0))  # cut again 29 -> 28
+    lv.observe(dict(CUT, my_price=28.0, low_rival=27.99), t + 600)           # answered again
+    assert 'S1' in lv.frozen and 'S1' in lv.stats['frozen']
+    lv.last_change['S1'] = t - 1000
+    assert lv.plan(dict(CUT, my_price=28.0, rec_price=27.5, low_rival=27.99)) is None
+    assert lv.stats['blocked']['cuts paused: chased by a rival'] == 1
+    assert lv.plan(dict(CUT, action='raise', my_price=28.0, rec_price=29.0, low_rival=29.5)) == 29.0   # raises still allowed
+    lv.unfreeze('S1')
+    assert 'S1' not in lv.frozen and lv.streak['S1'] == 0
+
+
+def test_unanswered_cut_resets_streak(tmp_path):
+    lv, _ = live_ready(tmp_path)
+    t = time.time()
+    lv.maybe_apply(dict(CUT))
+    lv.streak['S1'] = 1
+    lv.observe(dict(CUT, my_price=29.0, low_rival=30.0), t + 31 * 60)   # nobody followed within 30 min
+    assert lv.streak['S1'] == 0 and lv.cuts['S1']['answered'] is False
+
+
+def test_matching_the_low_is_not_counted_as_chased(tmp_path):
+    lv, _ = live_ready(tmp_path, chase_cuts=1)
+    lv.maybe_apply(dict(CUT, action='match_low', rec_price=29.0, low_rival=29.0))   # rival already at 29
+    lv.observe(dict(CUT, my_price=29.0, low_rival=29.0), time.time() + 60)
+    assert 'S1' not in lv.frozen
+
+
+def test_daily_drop_limit(tmp_path):
+    lv, _ = live_ready(tmp_path, max_drop_pct=10, max_step_pct=10)
+    now = time.time()
+    lv.seen['S1'].append((now - 3600, 33.0))                    # was 33.00 an hour ago
+    assert lv.plan(dict(CUT, my_price=30.0, rec_price=27.0), now) == 29.7   # floor = 33 x 0.90
+    assert lv.plan(dict(CUT, my_price=29.7, rec_price=27.0), now) is None
+    assert lv.stats['blocked']['24 h drop limit'] == 1
+
+
+def test_brake_state_survives_restart(tmp_path):
+    lv, logs = live_ready(tmp_path)
+    lv.frozen['S1'] = {'until': time.time() + 3600, 'why': 'test'}
+    lv.save_state()
+    os.makedirs(tmp_path / 'live', exist_ok=True)
+    import gzip as _gz
+    with _gz.open(tmp_path / 'live' / (time.strftime('%Y-%m-%d', time.gmtime()) + '.jsonl.gz'), 'wt') as f:
+        f.write(json.dumps({'t': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'sku': 'S1', 'from': 30.0, 'to': 29.0, 'status_code': 200}) + '\n')
+    lv2, _ = mk(tmp_path)
+    assert 'S1' in lv2.frozen and lv2.cuts['S1']['price'] == 29.0 and lv2.last_change['S1'] > 0
+    assert max(p for _, p in lv2.seen['S1']) == 30.0
+
+
+def test_day_is_central_time():
+    t = 1762995600   # 2025-11-13 01:00 UTC = 2025-11-12 19:00 Central
+    assert L.ct_day(t) == '2025-11-12'
