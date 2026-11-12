@@ -86,10 +86,68 @@ def war_penalty_pct(model, rate):
     return tab[-1][1]
 
 
-def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None):
+def suppression(n):
+    """(suppressed, lowest new offer landed price, its channel) from one ANY_OFFER_CHANGED notification.
+    Suppressed = Amazon shows no Buy Box: no Buy Box price in the summary and no offer marked winner (Nov 12 check: 211 of 214
+    messages on listings the competitive summary showed without a featured offer; 3 of 5,154 on listings with one)."""
+    s = n.get('Summary') or {}
+    win = any(o.get('IsBuyBoxWinner') for o in n.get('Offers') or [])
+    sup = not s.get('BuyBoxPrices') and not win
+    lows = [(x['LandedPrice']['Amount'], x.get('FulfillmentChannel')) for x in s.get('LowestPrices') or []
+            if x.get('Condition') == 'new' and (x.get('LandedPrice') or {}).get('Amount')]
+    if not lows:
+        lows = [((o.get('ListingPrice') or {}).get('Amount', 0) + (o.get('Shipping') or {}).get('Amount', 0), 'Amazon' if o.get('IsFulfilledByAmazon') else 'Merchant')
+                for o in n.get('Offers') or [] if o.get('SubCondition') == 'new' and o.get('SellerId') != ME]
+    lo = min(lows) if lows else (None, None)
+    return sup, lo[0], lo[1]
+
+
+def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None):
+    """Buy Box suppressed (Nick, Nov 12 2026): don't chase Amazon's target price; match the lowest offer on the listing
+    (any fulfillment, landed price), within min/max, and let the usual step limits and brakes work from there."""
+    me = offers[ME]
+    lo, hi = sku['min'], sku['max']
+    if not (lo and hi) or lo > hi or not low_any:
+        return None
+    rec = round(clip(low_any, lo, hi), 2)
+    change = abs(rec - me) >= 0.01
+    action = 'hold' if not change else ('match_low' if rec < me else 'raise')
+    daily = min(float(qty or 0), max(sku.get('v30') or 0.0, 0.0))   # recent sales pace; the Buy Box model doesn't apply here
+    def row(p):
+        m = margin(p, sku)
+        f_p, _ = fee(p, sku)
+        return {'price': p, 'p_win': None, 'units_24h': round(daily, 3), 'fees': round(f_p, 2), 'margin': round(m, 2),
+                'roi': round(m / sku['cost'], 4) if sku['cost'] else None, 'profit_24h': round(daily * m, 2), 'penalty': 0.0, 'exp_value_24h': None}
+    cur, best = row(me), row(rec)
+    ch = 'FBA' if low_ch == 'Amazon' else 'merchant-fulfilled' if low_ch == 'Merchant' else ''
+    reasons = [f'Buy Box suppressed: matching the lowest offer {low_any:.2f}' + (f' ({ch})' if ch else '')]
+    if low_any < lo - 0.005:
+        reasons.append(f'lowest offer is below your min {lo:.2f}')
+    if low_any > hi + 0.005:
+        reasons.append(f'lowest offer is above your max {hi:.2f}')
+    fees_src = 'amazon' if sku.get('fees') and _fees.fee_at(sku['fees'], me) else 'estimate'
+    if fees_src != 'amazon':
+        reasons.append("fees estimated (Amazon's fee for this SKU not loaded yet)")
+    rivals = {s_: p for s_, p in offers.items() if s_ != ME}
+    return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': min(rivals.values()) if rivals else None, 'low_any': low_any,
+            'n_rivals': len(rivals), 'winner': None, 'suppressed': True, 'foep': None, 'rec_price': rec if change else me, 'qty': qty,
+            'days_to_sell': round(qty / daily, 1) if daily > 0 and qty else None, 'v_future': None, 'action': action, 'gain_24h': None,
+            'cur': cur, 'best': best if change else cur, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(sku['lam'], 4),
+            'profit_day_now': cur['profit_24h'], 'profit_day_rec': (best if change else cur)['profit_24h'], 'roi_now': cur['roi'],
+            'roi_rec': (best if change else cur)['roi'], 'fees_src': fees_src, 'decay': None}
+
+
+def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None,
+           suppressed=False, low_any=None, low_ch=None):
     """offers: {seller: landed price} for FBA new offers on the listing; winner: Buy Box seller id or None.
-    sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None."""
-    if ME not in offers or len(offers) < 2:
+    sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None.
+    suppressed: Amazon shows no Buy Box on the listing; then the price matches the lowest offer instead (decide_suppressed)."""
+    if ME not in offers:
+        return None
+    if suppressed:
+        qty = my_stock if my_stock is not None else (sku.get('qty') or 0)
+        return decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune)
+    if len(offers) < 2:
         return None
     me = offers[ME]
     rivals = {s: p for s, p in offers.items() if s != ME}
@@ -176,7 +234,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if fees_src != 'amazon':
         reasons.append("fees estimated (Amazon's fee for this SKU not loaded yet)")
     rec_row = best if change else cur
-    return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': low, 'n_rivals': n_riv, 'winner': winner,
+    return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': low, 'n_rivals': n_riv, 'winner': winner, 'suppressed': False,
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
@@ -271,14 +329,15 @@ class Shadow:
             offs = {}
             win = None
             for o in p.get('Offers') or []:
+                if o.get('SubCondition') == 'new' and o.get('IsBuyBoxWinner'):
+                    win = o['SellerId']          # any fulfillment: a merchant-fulfilled offer can hold the Buy Box too
                 if o.get('SubCondition') != 'new' or not o.get('IsFulfilledByAmazon'):
                     continue
                 pr = (o.get('ListingPrice') or {}).get('Amount', 0) + (o.get('Shipping') or {}).get('Amount', 0)
                 offs[o['SellerId']] = pr
-                if o.get('IsBuyBoxWinner'):
-                    win = o['SellerId']
+            sup, low_any, low_ch = suppression(p)
             with self.lock:
-                self.offers[a] = (time.time(), offs, win)
+                self.offers[a] = (time.time(), offs, win, {'suppressed': sup, 'low_any': low_any, 'low_ch': low_ch})
                 if ME in offs:
                     self.pending[a] = True
                     self.pending.move_to_end(a)
@@ -298,7 +357,7 @@ class Shadow:
             bbs = r.get('avg_bb_share') if r.get('avg_bb_share') is not None else r.get('bb_share')
             bbs = clip((bbs or 25.0) / 100.0, 0.25, 1.0)  # conservative: at most 4x current sales if Nick won every Buy Box
             out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': r['cost'],
-                      'listed': r['listed_price'], 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
+                      'listed': r['listed_price'], 'v30': v, 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
         rate = capital_return(rows)
         with self.lock:
             self.listings = out
@@ -362,13 +421,14 @@ class Shadow:
             st = self.stock.get(sku['sku'])
             rs = self.rival_stock.get(asin)
             model = self.model
-        t, offs, win = o
+        t, offs, win, ex = o if len(o) == 4 else (*o, {})
         foep, age = (fo[1], time.time() - fo[0]) if fo else (None, None)
         rstock = rs[1] if (rs and time.time() - rs[0] < 8 * 3600) else None
         tune = dict(self.tune_fn() or {}) if self.tune_fn else {}
         if tune.get('decay_auto', True) and crate:
             tune['decay_per_day'] = crate
-        return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune)
+        return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
+                      suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'))
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""

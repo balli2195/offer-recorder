@@ -49,12 +49,14 @@ for pth in want('offers'):
         p = json.loads(d['body'])['Payload']['AnyOfferChangedNotification']
         t = ts_(p['OfferChangeTrigger']['TimeOfOfferChange'])
         off = [(o['SellerId'], o['ListingPrice']['Amount'] + o['Shipping']['Amount'], bool(o.get('IsBuyBoxWinner'))) for o in p['Offers'] if o.get('SubCondition') == 'new' and o.get('IsFulfilledByAmazon')]
-        by[p['OfferChangeTrigger']['ASIN']].append((t, off))
+        by[p['OfferChangeTrigger']['ASIN']].append((t, off, S.suppression(p)[0]))
 print('messages', len(seen), 'asins', len(by), flush=True)
 IDX = {}
+SUPP = {}   # per message: Buy Box suppressed (no Buy Box shown); those moments are left out of the Buy Box model
 for a, ms in by.items():
     ms.sort(key=lambda x: x[0])
-    IDX[a] = (np.array([m[0] for m in ms]), [{s: p for s, p, w in off} for t, off in ms], [{s for s, p, w in off if w} for t, off in ms])
+    IDX[a] = (np.array([m[0] for m in ms]), [{s: p for s, p, w in off} for t, off, _ in ms], [{s for s, p, w in off if w} for t, off, _ in ms])
+    SUPP[a] = [m[2] for m in ms]
 T1 = max(v[0][-1] for v in IDX.values())
 # ---------------- rival reactions to undercuts (by anyone)
 react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); floor = collections.defaultdict(lambda: 1e9); events = []
@@ -150,6 +152,7 @@ for t, sku, a, f in fo:
     if i < 0 or t - ts[i] > 6 * 3600: continue
     Pi = P[i]
     if ME not in Pi or len(Pi) < 2: continue
+    if SUPP[a][i]: continue   # no Buy Box to win: the repricer matches the lowest offer instead (shadow.decide_suppressed)
     y = bb_next(a, t)
     if y is None: continue
     me = Pi[ME]; low = min(q for s, q in Pi.items() if s != ME)

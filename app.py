@@ -523,7 +523,8 @@ def status():
     s['status_pid'] = os.getpid()
     if SH:
         s['shadow'] = dict(SH.stats, asins_tracked=len(SH.offers), skus_priced=len(SH.listings), foep_known=len(SH.foep), rival_stock_known=len(SH.rival_stock),
-                           fees_known=len(SH.fees), capital_rate=SH.capital_rate)
+                           fees_known=len(SH.fees), capital_rate=SH.capital_rate,
+                           suppressed_now=sum(1 for d in list(SH.latest.values()) if d.get('suppressed')))
         s['live'] = dict(LV.stats, env_live_mode=os.environ.get('LIVE_MODE', 'off'), config={k: (v if k != 'skus' else len(v)) for k, v in LV.cfg.items()})
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
     return jsonify(s)
@@ -576,7 +577,7 @@ def repricer_skus():
         d = SH.latest.get(asin) or {}
         out.append({'asin': asin, 'sku': s['sku'], 'title': s.get('title'), 'min': s['min'], 'max': s['max'], 'cost': s['cost'], 'qty': s.get('qty'),
                     'ss_repricing': s.get('ss_repricing'), 'live': s['sku'] in live_set, 'fulfillable': SH.stock.get(s['sku']),
-                    'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'foep', 'gain_24h', 'winner')} if d else None})
+                    'decision': {k: d.get(k) for k in ('t', 'action', 'my_price', 'rec_price', 'low_rival', 'low_any', 'foep', 'gain_24h', 'winner', 'suppressed')} if d else None})
     return jsonify(out)
 
 

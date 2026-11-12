@@ -150,3 +150,46 @@ def test_fees_pull_saves_and_feeds(tmp_path):
     fe2 = F.Fees(str(tmp_path), None, None, None)
     fe2.load()
     assert set(fe2.by_sku) == {'S1', 'S2'}
+
+
+def supp_body(asin, offers, summary_bb=False, lowest=None):
+    n = {'OfferChangeTrigger': {'ASIN': asin}, 'Summary': {}, 'Offers': [
+        {'SellerId': s, 'SubCondition': 'new', 'IsFulfilledByAmazon': fba, 'ListingPrice': {'Amount': p}, 'Shipping': {'Amount': 0}, 'IsBuyBoxWinner': w}
+        for s, p, fba, w in offers]}
+    if summary_bb:
+        n['Summary']['BuyBoxPrices'] = [{'Condition': 'new', 'LandedPrice': {'Amount': 30}}]
+    if lowest:
+        n['Summary']['LowestPrices'] = [{'Condition': 'new', 'FulfillmentChannel': ch, 'LandedPrice': {'Amount': p}} for ch, p in lowest]
+    return n
+
+
+def test_suppression_detected_and_lowest_offer_any_channel():
+    n = supp_body('A1', [(S.ME, 52.8, True, False), ('M1', 48.0, False, False), ('F1', 53.39, True, False)],
+                  lowest=[('Amazon', 52.8), ('Merchant', 48.0)])
+    assert S.suppression(n) == (True, 48.0, 'Merchant')
+    n2 = supp_body('A1', [(S.ME, 30.0, True, True), ('F1', 31.0, True, False)], summary_bb=True)
+    assert S.suppression(n2)[0] is False
+
+
+def test_suppressed_listing_matches_lowest_offer_not_target():
+    sku = dict(SKU, min=25.0, max=60.0, v30=0.4, fees=BANDS)
+    d = S.decide(MODEL, 'A1', {S.ME: 52.80, 'F1': 53.39}, None, sku, foep=29.0, foep_age=60, my_stock=24,
+                 suppressed=True, low_any=48.0, low_ch='Merchant')
+    assert d['suppressed'] and d['action'] == 'match_low' and d['rec_price'] == 48.0 and d['foep'] is None
+    assert 'Buy Box suppressed' in d['reasons'][0] and d['gain_24h'] is None and d['profit_day_now'] is not None
+    lo = S.decide(MODEL, 'A1', {S.ME: 52.80, 'F1': 53.39}, None, dict(sku, min=50.0), suppressed=True, low_any=48.0, low_ch='Merchant')
+    assert lo['rec_price'] == 50.0 and any('below your min' in r for r in lo['reasons'])
+    same = S.decide(MODEL, 'A1', {S.ME: 48.0}, None, sku, suppressed=True, low_any=48.0)
+    assert same['action'] == 'hold'
+    up = S.decide(MODEL, 'A1', {S.ME: 45.0, 'F1': 53.0}, None, sku, suppressed=True, low_any=48.0, low_ch='Merchant')
+    assert up['action'] == 'raise' and up['rec_price'] == 48.0
+
+
+def test_shadow_marks_suppressed_from_messages(tmp_path):
+    sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda: 'now')
+    sh.save_model(json.dumps(MODEL))
+    sh.on_listings([{'sku': 'S1', 'asin': 'A1', 'min_price': 25, 'max_price': 60, 'listed_price': 52.8, 'cost': 15, 'roi': 30, 'v30': 0.4, 'qty': 24}])
+    sh.on_message_bodies([json.dumps({'Payload': {'AnyOfferChangedNotification': supp_body('A1', [(S.ME, 52.8, True, False), ('F1', 53.39, True, False)],
+                                                                                           lowest=[('Amazon', 52.8), ('Merchant', 48.0)])}})])
+    d = sh.decide_one('A1')
+    assert d['suppressed'] and d['rec_price'] == 48.0
