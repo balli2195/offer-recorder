@@ -1,7 +1,7 @@
 """Live price executor for the repricer. OFF unless ALL of these hold for a SKU:
   1. Render env LIVE_MODE=on                        (Nick sets this himself)
   2. live config enabled=true and the SKU is listed  (POST /live with the recorder key)
-  3. Seller Snap repricing is OFF for that SKU        (latest Seller Snap snapshot; otherwise the two would fight)
+  3. Seller Snap isn't repricing that SKU            (while Nick still has Seller Snap; without it this check passes)
 Guardrails on every change: within the SKU's Seller Snap min/max, at most MAX_STEP_PCT per change (moves toward the target in steps),
 at least MIN_INTERVAL_S between changes per SKU, at most MAX_PER_DAY changes per SKU per day (Central-time day), never on a stale decision.
 Brakes on runs of price cuts (a loop with another repricer walks the price down; a bounce up and down costs little):
@@ -197,9 +197,7 @@ class Live:
             return None
         with self.lock:
             ss = self.ss_repricing.get(sku)
-        if ss is None:
-            return self._block('no Seller Snap snapshot for SKU')
-        if ss:
+        if ss:   # only while Nick still has Seller Snap: a SKU it isn't repricing (or no Seller Snap at all) is fine
             return self._block('Seller Snap repricing still on')
         me, rec, lo, hi = d['my_price'], d['rec_price'], d['min'], d['max']
         if not (lo and hi and lo <= rec <= hi):

@@ -9,6 +9,7 @@ Four loops write gzip JSONL to the Render disk:
   foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
   health/   daily seller performance report (account status, metrics) and suppressed-listings report
   keepa/    Keepa live offers with stock for in-stock ASINs, every 6 h, full responses (needs KEEPA_KEY)
+  traffic/  Amazon's Sales & Traffic report, last 30 days by child ASIN, daily, full JSON
   catalog/  Amazon's all-listings report (every SKU with Active / Inactive / Incomplete), every 3 h, full TSV
   fees/     Amazon's fee estimate (Product Fees API) for every sellable SKU at a price in each fee band; daily per SKU, full responses
 Endpoints: /healthz (open); /status, /files, /files/<path> (header X-Recorder-Key).
@@ -49,7 +50,9 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'health': {'last': None, 'account_status': None, 'suppressed_rows': None, 'last_error': None},
          'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None},
          'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None},
-         'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None}}
+         'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None},
+         'traffic': {'last': None, 'asins': None, 'last_error': None},
+         'limits': {'last': None, 'costs': None, 'overrides': None, 'last_error': None}}
 # What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
 STREAMS = {
     'offers': ('Offer changes', 'continuous', 'Every Amazon offer-change message for your listings (SQS), saved raw before it leaves the queue.'),
@@ -62,6 +65,8 @@ STREAMS = {
     'keepa': ('Keepa rival stock', 'every 6 h', 'Live offers with stock for in-stock ASINs, full Keepa responses.'),
     'fees': ('Amazon fees', 'daily per SKU, hourly for new SKUs', "Amazon's own fee estimate for every sellable SKU at a price under $10, $10-$50 and over $50, used by the repricer."),
     'catalog': ('Amazon listing status', 'every 3 h', "Amazon's all-listings report: every SKU on the account with Active / Inactive / Incomplete, so the Repricer page can show each listing's state."),
+    'traffic': ('Sales & Traffic', 'daily', "Amazon's Sales & Traffic report for the last 30 days by ASIN (units ordered, Buy Box %, page views): the repricer's sales speed and Buy Box share."),
+    'limits': ('Price limits from the Hub', 'hourly (pushed by the Hub)', 'Unit costs (InventoryLab, order ledger, lead cost), min/max overrides (liquidation, manual) and the limit settings, sent by the Hub.'),
     'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
     'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
 }
@@ -472,6 +477,29 @@ def snapshot_catalog():
         STATE['catalog'].update(last=iso(t), skus=len(rows), by_status=by, last_error=None)
 
 
+TRAFFIC_EVERY = int(os.environ.get('TRAFFIC_EVERY_S', '86400'))
+
+
+def pull_traffic():
+    """Amazon Sales & Traffic for the last 30 days by child ASIN, saved in full; units and Buy Box % feed the repricer."""
+    t = now()
+    end = (t - dt.timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+    start = (end - dt.timedelta(days=29)).replace(hour=0, minute=0, second=0)
+    b = run_report('GET_SALES_AND_TRAFFIC_REPORT', start, end, options={'dateGranularity': 'DAY', 'asinGranularity': 'CHILD'})
+    j = json.loads(b.decode('utf-8-sig'))
+    write_once(os.path.join(DATA, 'traffic', t.strftime('%Y-%m-%d') + '.jsonl.gz'), [json.dumps({'taken_at': iso(t), 'start': iso(start), 'end': iso(end), 'body': j})])
+    by = {}
+    for a in j.get('salesAndTrafficByAsin') or []:
+        tr, sa = a.get('trafficByAsin') or {}, a.get('salesByAsin') or {}
+        k = a.get('childAsin') or a.get('asin')
+        if k:
+            by[k] = {'units': sa.get('unitsOrdered') or 0, 'bb': tr.get('buyBoxPercentage'), 'pv': tr.get('pageViews') or 0}
+    if SH:
+        _safe(SH.on_traffic, by)
+    with LOCK:
+        STATE['traffic'].update(last=iso(t), asins=len(by), last_error=None)
+
+
 def keepa_asins():
     with LOCK:
         return sorted(set(IN_STOCK) | {a for s, a in SELLABLE if a})
@@ -484,6 +512,9 @@ def pull_keepa(wait=time.sleep):
         raise RuntimeError('no in-stock ASINs yet')
     t, used, left = now(), 0, None
     path = os.path.join(DATA, 'keepa', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz')
+    with LOCK:
+        year = time.time() - (STATE['keepa'].get('year_at') or 0) > 20 * 3600   # once a day: a year of history (same tokens) for the max price rule
+    days = 365 if year else 1
     for i in range(0, len(asins), KEEPA_BATCH):
         b = asins[i:i + KEEPA_BATCH]
         for k in range(30):
@@ -491,7 +522,7 @@ def pull_keepa(wait=time.sleep):
                 wait(60)
                 left = None  # recheck from the next response
             r = requests.get('https://api.keepa.com/product', timeout=300, params={'key': os.environ['KEEPA_KEY'], 'domain': 1, 'asin': ','.join(b),
-                             'offers': 20, 'stock': 1, 'only_live_offers': 1, 'history': 1, 'days': 1})
+                             'offers': 20, 'stock': 1, 'only_live_offers': 1, 'history': 1, 'days': days})
             j = r.json()
             left = j.get('tokensLeft', left)
             if r.status_code == 429 or not j.get('products'):
@@ -508,6 +539,9 @@ def pull_keepa(wait=time.sleep):
             STATE['keepa'].update(tokens_used=used, tokens_left=j.get('tokensLeft'))
     with LOCK:
         STATE['keepa'].update(last=iso(t), asins=len(asins), last_error=None)
+        if year:
+            STATE['keepa']['year_at'] = time.time()
+            STATE['keepa']['year_last'] = iso(t)
 
 
 def every(name, seconds, fn, needs):
@@ -611,6 +645,23 @@ def repricer_skus():
     return jsonify(out)
 
 
+@app.post('/limits')
+def limits_set():
+    """From the Hub (hourly and on every change): unit costs, min/max overrides and limit settings."""
+    need_key()
+    r = SH.on_limits(request.get_json(force=True) or {})
+    with LOCK:
+        STATE['limits'].update(last=iso(), last_error=None, **r)
+    return jsonify({'ok': True, **r, 'priced': len(SH.listings)})
+
+
+@app.get('/repricer/limits_check')
+def limits_check():
+    """The repricer's own min/max next to Seller Snap's, SKU by SKU, for the switch-over check."""
+    need_key()
+    return jsonify(SH.limits_check())
+
+
 @app.get('/repricer/table')
 def repricer_table():
     """Every SKU (Seller Snap + Amazon's listing report) with listing state, stock, Seller Snap settings, live flag and latest decision."""
@@ -710,6 +761,7 @@ def start():
         STATE['foep']['last_error'] = 'not configured'
     threading.Thread(target=every, args=('health', HEALTH_EVERY, snapshot_health, sp), daemon=True).start()
     threading.Thread(target=delayed, args=(120, every, 'catalog', CATALOG_EVERY, snapshot_catalog, sp), daemon=True).start()
+    threading.Thread(target=delayed, args=(300, every, 'traffic', TRAFFIC_EVERY, pull_traffic, sp), daemon=True).start()
     threading.Thread(target=delayed, args=(900, every, 'keepa', KEEPA_EVERY, pull_keepa, ['KEEPA_KEY']), daemon=True).start()
     _safe(FE.load)
     STATE['fees']['skus'] = len(FE.by_sku)

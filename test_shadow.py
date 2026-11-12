@@ -241,3 +241,48 @@ def test_listing_states_and_table(tmp_path):
     assert T['E']['state'] == 'archived' and not T['E'].get('in_seller_snap') and T['E']['channel'] == 'MFN'
     sh.on_fyp([{'Status': 'Search Suppressed', 'Reason': 'Missing info', 'SKU': 'A'}])
     assert {r['sku']: r for r in sh.table()}['A']['state'] == 'deactivated'
+
+
+import limits as LM
+
+
+def test_rule_min_hits_12pct_and_cost_order():
+    m = LM.rule_min(15.0, BANDS, 1.40, 0.12)
+    f = F.fee_at(BANDS, m)[0]
+    assert (m - f - 15 - 1.40) / 15 >= 0.12 and (m - 0.01 - F.fee_at(BANDS, m - 0.01)[0] - 15 - 1.40) / 15 < 0.12
+    costs = {'sku': {'S1': [9.5, 'inventorylab']}, 'asin_ledger': {'A2': 7.0}, 'asin_lead': {'A3': 5.0}}
+    assert LM.resolve_cost('S1', 'A1', costs, 12) == (9.5, 'InventoryLab')
+    assert LM.resolve_cost('S2', 'a2', costs, 12) == (7.0, 'order ledger')
+    assert LM.resolve_cost('S3', 'A3', costs, 12) == (5.0, 'lead cost')
+    assert LM.resolve_cost('S4', 'A4', costs, 12) == (12.0, 'Seller Snap')
+
+
+def test_year_high_and_max_rule():
+    now = 10_000_000
+    c = [now - 400 * 1440, 5000, now - 300 * 1440, 4200, now - 100 * 1440, -1, now - 50 * 1440, 3900]
+    hi, days = LM.fba_year_high({'csv': [None] * 10 + [c]}, now_min=now)
+    assert hi == 50.0 and 310 < days < 320          # $50 carried into the year window; the 50-day -1 gap does not count
+    st = {'max_floor_mult': 1.25, 'max_new_mult': 2.0, 'max_history_days': 90}
+    assert LM.resolve_max(30.0, (50.0, 250), st)[0] == 50.0
+    assert LM.resolve_max(45.0, (50.0, 250), st)[0] == 56.25      # floor 1.25 x min
+    assert LM.resolve_max(30.0, (50.0, 20), st)[0] == 60.0        # short history: 2 x min
+
+
+def test_rebuild_from_own_data_and_bb_raise(tmp_path):
+    sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda: 'now')
+    sh.save_model(json.dumps(MODEL))
+    sh.on_catalog([{'seller-sku': 'S1', 'asin1': 'A1', 'status': 'Active', 'fulfillment-channel': 'AMAZON_NA', 'item-name': 'Thing', 'price': '30'}])
+    sh.on_inventory([{'sellerSku': 'S1', 'inventoryDetails': {'fulfillableQuantity': 6}}])
+    sh.on_fees({'S1': {'t': time.time(), 'bands': BANDS}})
+    sh.on_traffic({'A1': {'units': 15, 'bb': 40.0, 'pv': 300}})
+    sh.fba_high['A1'] = (36.0, 300)
+    sh.on_limits({'settings': {'min_roi': 0.12, 'prep': 1.40}, 'costs': {'sku': {'S1': [15.0, 'inventorylab']}}, 'overrides': {}})
+    x = sh.listings['A1']
+    assert x['src'] == {'cost': 'InventoryLab', 'min': '12% ROI', 'max': 'year-high FBA price', 'sales': 'Amazon sales & traffic'}
+    assert x['max'] == 36.0 and abs(x['v30'] - 0.5) < 1e-9 and x['min'] == LM.rule_min(15.0, BANDS, 1.40, 0.12)
+    sh.on_limits({'settings': {}, 'costs': {'sku': {'S1': [15.0, 'inventorylab']}}, 'overrides': {'S1': {'min': 20.0, 'max': None, 'source': 'liquidation'}}})
+    assert sh.listings['A1']['min'] == 20.0 and sh.listings['A1']['src']['min'] == 'liquidation min'
+    d = S.decide(MODEL, 'A1', {S.ME: 35.0, 'R1': 35.5}, 'R1', dict(sh.listings['A1'], fees=BANDS), bb_price=39.0)
+    assert d['max'] == 39.0 and any('max raised' in r for r in d['reasons'])
+    chk = sh.limits_check()
+    assert chk['summary']['compared'] == 0          # no Seller Snap rows to compare with here

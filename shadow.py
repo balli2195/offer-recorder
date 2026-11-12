@@ -12,6 +12,7 @@ Model: model.json written by tools/train.py (Buy Box logistic models, per-rival 
 """
 import json, math, os, statistics, threading, time, collections, datetime as dt
 import fees as _fees
+import limits as L
 
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
@@ -20,7 +21,8 @@ MIN_GAIN_ABS = 0.50      # $/day of expected profit before a change is recommend
 MIN_GAIN_REL = 0.05      # or 5 %
 DEBOUNCE_S = 120         # at most one decision per ASIN every 2 minutes
 DECAY_PER_DAY = float(os.environ.get('SHADOW_DECAY_PER_DAY', '0.003'))  # cost of waiting to sell, as a share of price per day
-PREP = float(os.environ.get('PREP_FEE', '1.40'))   # Nick's prep cost per unit, on every SKU (also in Seller Snap's ROI)
+PREP = float(os.environ.get('PREP_FEE', '1.40'))   # Nick's prep cost per unit, on every SKU; the Hub's limit settings override it
+LIMIT_DEFAULTS = {'min_roi': 0.12, 'prep': 1.40, 'max_floor_mult': 1.25, 'max_new_mult': 2.0, 'max_history_days': 90}
 FALLBACK_FBA = 4.11  # only until Amazon's fee for a SKU is loaded (median FBA fee in the Nov 12 sample)
 
 
@@ -172,7 +174,7 @@ def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None, me_bac
 
 
 def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None,
-           suppressed=False, low_any=None, low_ch=None, me_backordered=False, rivals_backordered=0):
+           suppressed=False, low_any=None, low_ch=None, me_backordered=False, rivals_backordered=0, bb_price=None):
     """offers: {seller: landed price} for FBA new offers on the listing; winner: Buy Box seller id or None.
     sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None.
     suppressed: Amazon shows no Buy Box on the listing; then the price matches the lowest offer instead (decide_suppressed)."""
@@ -198,9 +200,14 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     g_abs = tune.get('min_gain_abs', MIN_GAIN_ABS)
     g_rel = tune.get('min_gain_rel', MIN_GAIN_REL)
     lo, hi = sku['min'], sku['max']
+    raised = None
+    if hi and winner and winner != ME and bb_price and bb_price > hi + 0.005:   # a rival holds the Buy Box above the max: raise the max to it (Nick, Nov 12)
+        raised, hi = hi, round(bb_price, 2)
     if not (lo and hi) or lo > hi:
         return None
     cands = {round(me, 2), round(low, 2), round(low - 0.01, 2)}
+    if raised:
+        cands.add(hi)
     if use_foep:  # small steps only when Amazon's target is known; without it the Buy Box model is much weaker (AUC ~0.72 vs ~0.89)
         cands |= {math.floor(use_foep * 100) / 100.0, round(me * 1.01, 2), round(me * 1.02, 2), round(me * 0.99, 2)}
     if me <= low - 0.005:  # Nick alone at the low: the next offer minus a cent is a raise candidate
@@ -266,6 +273,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         reasons.append(f'stock share {share:.0%}')
     if lo > low:
         reasons.append('floor above lowest rival')
+    if raised:
+        reasons.append(f'max raised from {raised:.2f} to the Buy Box price {hi:.2f} held by a rival')
     if me_backordered:
         reasons.append('your offer is backordered: no cuts until the stock is available')
     if rivals_backordered:
@@ -334,6 +343,11 @@ class Shadow:
         self.catalog = {}           # sku -> Amazon all-listings report row {asin, title, status, channel, price, qty}
         self.catalog_t = None
         self.fyp = {}               # sku -> (status, reason) from Amazon's suppressed-listings report
+        self.limits = {}            # from the Hub (POST /limits): settings, costs, overrides
+        self.fba_high = {}          # asin -> (highest lowest-FBA price in the past year, days of FBA history), from Keepa
+        self.traffic = {}           # asin -> {units, bb, pv} over the last 30 days (Amazon Sales & Traffic)
+        self.traffic_t = None
+        self.load_state()
         self.pending = collections.OrderedDict()
         self.last_decided = {}
         self.model = None
@@ -383,37 +397,179 @@ class Shadow:
             a = p['OfferChangeTrigger']['ASIN']
             offs, win, me_bo, n_bo = fba_offers(p)
             sup, low_any, low_ch = suppression(p)
+            bbp = [x for x in (p.get('Summary') or {}).get('BuyBoxPrices') or [] if (x.get('condition') or x.get('Condition') or '').lower() == 'new']
+            bb_price = ((bbp[0].get('LandedPrice') or {}).get('Amount')) if bbp else None
             with self.lock:
                 self.offers[a] = (time.time(), offs, win, {'suppressed': sup, 'low_any': low_any, 'low_ch': low_ch,
-                                                           'me_backordered': me_bo, 'rivals_backordered': n_bo})
+                                                           'me_backordered': me_bo, 'rivals_backordered': n_bo, 'bb_price': bb_price})
                 if ME in offs:
                     self.pending[a] = True
                     self.pending.move_to_end(a)
 
     def on_listings(self, rows):
-        by = {}
-        for r in rows:
-            a = r.get('asin')
-            if not a or not r.get('cost') or not r.get('listed_price'):
-                continue
-            if a in by and (by[a].get('qty') or 0) >= (r.get('qty') or 0):
-                continue
-            by[a] = r
-        out = {}
-        for a, r in by.items():
-            v = r.get('v30') or 0.0
-            bbs = r.get('avg_bb_share') if r.get('avg_bb_share') is not None else r.get('bb_share')
-            bbs = clip((bbs or 25.0) / 100.0, 0.25, 1.0)  # conservative: at most 4x current sales if Nick won every Buy Box
-            out[a] = {'sku': r['sku'], 'title': (r.get('title') or '')[:120], 'min': r.get('min_price'), 'max': r.get('max_price'), 'cost': r['cost'],
-                      'listed': r['listed_price'], 'v30': v, 'lam': max(v, 0.01) / 24.0 / bbs, 'qty': r.get('qty'), 'ss_repricing': bool(r.get('repricing'))}
-        rate = capital_return(rows)
+        """Seller Snap snapshot: kept only as a fallback (cost, min, sales) while the SKU has no data of Nick's own, and for its on/off flag."""
         ss = {r['sku']: r for r in rows if r.get('sku')}
         with self.lock:
-            self.listings = out
             self.ss_rows = ss
+        self.rebuild()
+
+    # --- own data (no Seller Snap)
+    def state_path(self, name):
+        return os.path.join(self.data, 'limits', name)
+
+    def load_state(self):
+        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic')):
+            try:
+                with open(self.state_path(name)) as f:
+                    v = json.load(f)
+                if attr == 'fba_high':
+                    v = {k: tuple(x) for k, x in v.items()}
+                setattr(self, attr, v)
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+
+    def save_state(self, name, obj):
+        try:
+            os.makedirs(os.path.dirname(self.state_path(name)), exist_ok=True)
+            tmp = self.state_path(name) + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(obj, f)
+            os.replace(tmp, self.state_path(name))
+        except OSError:
+            pass
+
+    def on_limits(self, body):
+        """From the Hub: limit settings, unit costs and min/max overrides."""
+        lim = {'sent_at': body.get('sent_at'), 'settings': {**LIMIT_DEFAULTS, **(body.get('settings') or {})},
+               'costs': body.get('costs') or {}, 'overrides': body.get('overrides') or {}}
+        with self.lock:
+            self.limits = lim
+        self.save_state('limits.json', lim)
+        self.rebuild()
+        return {'costs': len(lim['costs'].get('sku') or {}), 'overrides': len(lim['overrides'])}
+
+    def on_traffic(self, by_asin):
+        with self.lock:
+            self.traffic = by_asin
+            self.traffic_t = time.time()
+        self.save_state('traffic.json', by_asin)
+        self.rebuild()
+
+    def rebuild(self):
+        """The priced listings, one SKU per ASIN, from Nick's own data: Amazon's listing report and FBA inventory for the SKUs,
+        the Hub for cost and overrides, Amazon's fees for the 12% ROI min, Keepa's year of FBA prices for the max, and Amazon's
+        Sales & Traffic for sales speed and Buy Box share. Seller Snap only fills gaps (and says so in each field's source)."""
+        global PREP
+        with self.lock:
+            cat, inv, ss, lim = dict(self.catalog), dict(self.inv), dict(self.ss_rows), dict(self.limits)
+            fees_by, fba_med, fh, tr = dict(self.fees), self.fba_median, dict(self.fba_high), dict(self.traffic)
+        st = {**LIMIT_DEFAULTS, **(lim.get('settings') or {})}
+        PREP = float(st['prep'])
+        ov, costs = lim.get('overrides') or {}, lim.get('costs') or {}
+        skus = (set(cat) | set(inv)) if cat else set(ss)
+        best = {}
+        for sku in skus:
+            c, iv, r = cat.get(sku), inv.get(sku), ss.get(sku)
+            if c and c.get('channel') == 'MFN':
+                continue
+            asin = (c or {}).get('asin') or (r or {}).get('asin')
+            if not asin:
+                continue
+            fu = (iv or {}).get('fulfillable')
+            if fu is None:
+                fu = (r or {}).get('qty') or 0
+            tot = fu + (iv or {}).get('reserved', 0) + (iv or {}).get('inbound', 0)
+            if tot <= 0:
+                continue
+            if asin not in best or (fu, tot) > best[asin][0]:
+                best[asin] = ((fu, tot), sku)
+        out, miss, src = {}, collections.Counter(), collections.Counter()
+        for asin, (_, sku) in best.items():
+            c, iv, r = cat.get(sku) or {}, inv.get(sku) or {}, ss.get(sku) or {}
+            cost, csrc = L.resolve_cost(sku, asin, costs, r.get('cost'))
+            bands = (fees_by.get(sku) or {}).get('bands')
+            o = ov.get(sku) or {}
+            if o.get('min') is not None:
+                mn, nsrc = float(o['min']), (o.get('source') or 'override') + ' min'
+            elif cost:
+                mn, nsrc = L.rule_min(cost, bands, PREP, st['min_roi'], fba_med), f"{st['min_roi']:.0%} ROI"
+            elif r.get('min_price'):
+                mn, nsrc = r['min_price'], 'Seller Snap'
+            else:
+                mn, nsrc = None, None
+            if o.get('max') is not None:
+                mx, xsrc = float(o['max']), (o.get('source') or 'override') + ' max'
+            else:
+                mx, xsrc = L.resolve_max(mn, fh.get(asin), st)
+            if mn and mx and mx < mn:
+                mx, xsrc = mn, 'min (max was below it)'
+            if tr:
+                t = tr.get(asin) or {}
+                v30, bbs, dsrc = (t.get('units') or 0) / 30.0, t.get('bb'), 'Amazon sales & traffic'
+            else:
+                v30 = r.get('v30') or 0.0
+                bbs = r.get('avg_bb_share') if r.get('avg_bb_share') is not None else r.get('bb_share')
+                dsrc = 'Seller Snap' if r else None
+            bbs = clip((bbs if bbs is not None else 25.0) / 100.0, 0.25, 1.0)  # conservative: at most 4x current sales if Nick won every Buy Box
+            if not (cost and mn and mx):
+                miss['no cost' if not cost else 'no min/max'] += 1
+                continue
+            for k, v in (('cost', csrc), ('min', nsrc), ('max', xsrc), ('sales', dsrc)):
+                src[f'{k}: {v}'] += 1
+            out[asin] = {'sku': sku, 'title': (c.get('title') or r.get('title') or '')[:120], 'min': round(mn, 2), 'max': round(mx, 2), 'cost': round(cost, 4),
+                         'listed': c.get('price') or r.get('listed_price'), 'v30': round(v30, 4), 'lam': max(v30, 0.01) / 24.0 / bbs,
+                         'qty': iv.get('fulfillable', r.get('qty')), 'ss_repricing': bool(r.get('repricing')) if r else False,
+                         'src': {'cost': csrc, 'min': nsrc, 'max': xsrc, 'sales': dsrc},
+                         'ss_min': r.get('min_price'), 'ss_max': r.get('max_price'), 'ss_cost': r.get('cost'),
+                         'year_high': (fh.get(asin) or (None, None))[0], 'year_days': (fh.get(asin) or (None, None))[1]}
+        rate = self.own_capital_return(out, inv, cat, costs, fees_by, fba_med) if (tr and costs) else capital_return(list(ss.values()))
+        with self.lock:
+            self.listings = out
             if rate:
                 self.capital_rate = rate['per_day']
                 self.stats['capital'] = rate
+            self.stats['limits'] = {'priced': len(out), 'skipped': dict(miss), 'sources': dict(src), 'hub_sent_at': lim.get('sent_at'),
+                                    'year_highs': len(fh), 'traffic_asins': len(tr), 'settings': st}
+
+    def own_capital_return(self, listings, inv, cat, costs, fees_by, fba_med):
+        """Cost of waiting from Nick's own numbers: profit a day (30-day units x profit per unit at the current price) over the
+        money in inventory (on hand + reserved + inbound, at cost + prep)."""
+        prof = cap = cogs = 0.0
+        for a, x in listings.items():
+            p = x.get('listed') or x['min']
+            sk = {'cost': x['cost'], 'fees': (fees_by.get(x['sku']) or {}).get('bands'), 'fixed_fee': fba_med}
+            prof += x['v30'] * margin(p, sk)
+            cogs += x['v30'] * (x['cost'] + PREP)
+        for sku, iv in inv.items():
+            q = iv.get('fulfillable', 0) + iv.get('reserved', 0) + iv.get('inbound', 0)
+            if q <= 0:
+                continue
+            cost, _ = L.resolve_cost(sku, (cat.get(sku) or {}).get('asin'), costs)
+            if cost:
+                cap += q * (cost + PREP)
+        if cap <= 0 or cogs <= 0:
+            return None
+        return {'per_day': round(clip(prof / cap, 0.0005, 0.02), 5), 'profit_per_day': round(prof, 2), 'capital': round(cap, 2),
+                'days_of_stock': round(cap / cogs, 1), 'roi_per_turn': round(prof / cogs, 4), 'source': 'own data'}
+
+    def limits_check(self):
+        """Own min/max next to Seller Snap's, for the switch-over check."""
+        with self.lock:
+            L_ = dict(self.listings)
+        rows, d_min, d_max = [], [], []
+        for a, x in L_.items():
+            if not (x.get('ss_min') and x.get('ss_max')):
+                continue
+            dm = x['min'] / x['ss_min'] - 1
+            dx = x['max'] / x['ss_max'] - 1
+            d_min.append(dm); d_max.append(dx)
+            rows.append({'asin': a, 'sku': x['sku'], 'title': x['title'], 'min': x['min'], 'ss_min': x['ss_min'], 'min_diff': round(dm, 4),
+                         'max': x['max'], 'ss_max': x['ss_max'], 'max_diff': round(dx, 4), 'cost': x['cost'], 'ss_cost': x.get('ss_cost'),
+                         'src': x['src'], 'year_high': x.get('year_high'), 'year_days': x.get('year_days')})
+        q = lambda v, k: sorted(v)[int(k * (len(v) - 1))] if v else None
+        summ = {'compared': len(rows), 'min_within_5pct': sum(1 for v in d_min if abs(v) <= 0.05), 'max_within_5pct': sum(1 for v in d_max if abs(v) <= 0.05),
+                'min_diff_median': q(d_min, .5), 'max_diff_median': q(d_max, .5)}
+        return {'summary': summ, 'rows': sorted(rows, key=lambda r: -abs(r['min_diff']))}
 
     def on_fees(self, by_sku):
         f = [b['bands']['mid']['fba'] for b in by_sku.values() if (b.get('bands') or {}).get('mid')]
@@ -422,6 +578,7 @@ class Shadow:
             if f:
                 self.fba_median = statistics.median(f)
             self.stats['fees_known'] = len(by_sku)
+        self.rebuild()
 
     def on_competitive_summary(self, asin, body):
         """One ASIN's competitive summary (segments sweep): reference prices and whether any featured offer exists."""
@@ -500,6 +657,7 @@ class Shadow:
         with self.lock:
             self.stock = m
             self.inv = det
+        self.rebuild()
 
     def on_catalog(self, rows):
         """Amazon's all-listings report (every SKU on the account, with Active / Inactive / Incomplete)."""
@@ -514,6 +672,7 @@ class Shadow:
         with self.lock:
             self.catalog = c
             self.catalog_t = time.time()
+        self.rebuild()
 
     def on_fyp(self, rows):
         """Amazon's suppressed-listings report: listings Amazon hides from search (missing info, etc.)."""
@@ -545,6 +704,7 @@ class Shadow:
         with self.lock:
             ss_rows, cat, inv, latest, listings = dict(self.ss_rows), dict(self.catalog), dict(self.inv), dict(self.latest), dict(self.listings)
             refs = dict(self.refs)
+            tr_ = dict(self.traffic)
         live = set(live_skus)
         priced = {v['sku']: a for a, v in listings.items()}
         out = []
@@ -553,14 +713,17 @@ class Shadow:
             asin = (r or {}).get('asin') or (c or {}).get('asin')
             a_pr = priced.get(sku)
             d = latest.get(a_pr) if a_pr else None
+            pl = listings.get(a_pr) if a_pr else None
             bb = (r or {}).get('avg_bb_share')
             out.append({'sku': sku, 'asin': asin, 'title': (r or {}).get('title') or (c or {}).get('title'),
                         'state': self.listing_state(sku, r, c, iv), 'amazon_status': (c or {}).get('status'), 'channel': (c or {}).get('channel'),
                         'search_suppressed': (self.fyp.get(sku) or (None, None))[1] or None,
                         'in_seller_snap': r is not None, 'ss_repricing': (r or {}).get('repricing'), 'preset': (r or {}).get('preset'),
-                        'price': (r or {}).get('listed_price') or (c or {}).get('price'), 'min': (r or {}).get('min_price'), 'max': (r or {}).get('max_price'),
-                        'cost': (r or {}).get('cost'), 'roi': (r or {}).get('roi'), 'bb_share': bb if bb is not None else (r or {}).get('bb_share'),
-                        'v30': (r or {}).get('v30'), 'fulfillable': (iv or {}).get('fulfillable', 0), 'inbound': (iv or {}).get('inbound', 0),
+                        'price': (c or {}).get('price') or (r or {}).get('listed_price'),
+                        'min': (pl or {}).get('min'), 'max': (pl or {}).get('max'), 'cost': (pl or {}).get('cost'), 'limit_src': (pl or {}).get('src'),
+                        'ss_min': (r or {}).get('min_price'), 'ss_max': (r or {}).get('max_price'),
+                        'roi': (r or {}).get('roi'), 'bb_share': (tr_.get(asin) or {}).get('bb') if tr_ else (bb if bb is not None else (r or {}).get('bb_share')),
+                        'v30': round(((tr_.get(asin) or {}).get('units') or 0) / 30.0, 2) if tr_ else (r or {}).get('v30'), 'fulfillable': (iv or {}).get('fulfillable', 0), 'inbound': (iv or {}).get('inbound', 0),
                         'reserved': (iv or {}).get('reserved', 0), 'live': sku in live, 'priced': a_pr is not None,
                         'priced_sku': (listings.get(asin) or {}).get('sku') if asin else None,
                         'competitive_price': ((refs.get(asin) or (None, {}))[1] or {}).get('CompetitivePrice') if asin else None,
@@ -582,6 +745,20 @@ class Shadow:
             self.foep[sku] = (time.time(), v)
 
     def on_keepa_products(self, products):
+        highs = {}
+        for p in products or []:
+            c = (p.get('csv') or [None] * 11)
+            c = c[10] if len(c) > 10 else None
+            if c and len(c) >= 4 and (c[-2] - c[0]) > 30 * 1440:   # only a pull with a long history (the daily year pull)
+                h = L.fba_year_high(p, now_min=int(time.time() / 60) - L.KEEPA_EPOCH_MIN)
+                if h:
+                    highs[p['asin']] = h
+        if highs:
+            with self.lock:
+                self.fba_high.update(highs)
+                fh = dict(self.fba_high)
+            self.save_state('fba_high.json', fh)
+            self.rebuild()
         for p in products or []:
             offs = []
             for o in p.get('offers') or []:
@@ -621,7 +798,7 @@ class Shadow:
             tune['decay_per_day'] = crate
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
                       suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'),
-                      me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0))
+                      me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0), bb_price=ex.get('bb_price'))
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""
