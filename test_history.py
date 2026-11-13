@@ -38,3 +38,23 @@ def test_held_buy_box_since(tmp_path):
     assert h.held('A1', now - 5400, 'ME') is True         # held it at the start of a 90-minute window
     h.add([body('A1', iso(600), [('ME', 28.99, 0, True, True, False), ('R1', 29.0, 0, True, False, False)])])
     assert h.held('A1', now - 1800, 'ME') is True
+
+
+def test_shared_winner_flags(tmp_path):
+    h = HM.History(str(tmp_path))
+    ME = HM.AMAZON_ME
+    # Amazon flags two winners; Nick listed second: he still counts as holding it, and the point says the flag is shared
+    h.add([body('A1', iso(600), [('R1', 29.0, 0, True, True, False), (ME, 29.5, 0, True, True, False)])])
+    now = time.time()
+    assert h.held('A1', now - 1800, ME) is True
+    q = h.query('A1', hours=1, me=ME)
+    assert q['points'][-1][2] == ME and q['points'][-1][3] == 2
+
+
+def test_history_migrates_old_table(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(str(tmp_path / 'history.db')); db.execute('CREATE TABLE h (asin TEXT, t REAL, offers TEXT, winner TEXT)')
+    db.execute("INSERT INTO h VALUES ('A1', ?, '[[\"R1\",30.0,1,0]]', 'R1')", (time.time() - 60,)); db.commit(); db.close()
+    h = HM.History(str(tmp_path))
+    q = h.query('A1', hours=1)
+    assert q['points'][-1][2] == 'R1' and q['points'][-1][3] == 1

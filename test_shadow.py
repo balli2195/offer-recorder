@@ -350,3 +350,12 @@ def test_targets_survive_restart_and_changed_listings_are_queued(tmp_path):
     sh.on_message_bodies([body('A1', [(S.ME, 30.0, True), ('R', 31.0, False)]), body('A2', [(S.ME, 30.0, True), ('R', 31.0, False)])])
     assert list(sh.foep_wanted) == ['S2']                                    # S1's target is fresh; S2 has none
     assert sh.take_foep_wanted(40, {'S2'}) == ['S2'] and not sh.foep_wanted
+
+
+def test_nick_is_holder_when_flagged_with_others():
+    n = {'Offers': [{'SellerId': 'R1', 'SubCondition': 'new', 'IsFulfilledByAmazon': True, 'IsBuyBoxWinner': True, 'ListingPrice': {'Amount': 29.0}, 'Shipping': {'Amount': 0}},
+                    {'SellerId': S.ME, 'SubCondition': 'new', 'IsFulfilledByAmazon': True, 'IsBuyBoxWinner': True, 'ListingPrice': {'Amount': 29.5}, 'Shipping': {'Amount': 0}},
+                    {'SellerId': 'R2', 'SubCondition': 'new', 'IsFulfilledByAmazon': False, 'IsBuyBoxWinner': True, 'ListingPrice': {'Amount': 28.0}, 'Shipping': {'Amount': 0}}]}
+    assert S.fba_offers(n)[1] == S.ME
+    n['Offers'][1]['IsBuyBoxWinner'] = False
+    assert S.fba_offers(n)[1] == 'R1'    # first flagged rival
