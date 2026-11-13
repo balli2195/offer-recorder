@@ -314,3 +314,12 @@ def test_ab_test_skus_use_seller_snap_limits_and_are_tagged(tmp_path):
     assert sh.step() == 1
     t = json.loads(written[-1][0])
     assert t['arm'] == 'repricer' and t['ab_group'] == 'A' and t['ab_day'] == 0 and t['ab_dry_run'] is True
+
+
+def test_rival_rate_uses_the_listing_record_pulled_toward_the_seller():
+    m = dict(MODEL, rivals={'R': {'rate': 0.5, 'n': 100, 'k': 50, 'lag_min': 10.0}}, rival_default={'rate': 0.2, 'lag_min': 12.0},
+             rival_listing={'R|A1': {'k': 0, 'n': 30, 'lag_min': None}, 'R|A2': {'k': 10, 'n': 10, 'lag_min': 4.0}}, listing_weight=10)
+    assert S.rival_info(m, 'R') == (0.5, 10.0, False)
+    r, lag, own = S.rival_info(m, 'R', 'A1'); assert own and abs(r - 0.125) < 1e-9 and lag == 10.0     # ignores undercuts on A1
+    r, lag, own = S.rival_info(m, 'R', 'A2'); assert abs(r - 0.75) < 1e-9 and abs(lag - 7.0) < 1e-9    # fights on A2, and fast
+    assert S.rival_info(m, 'R', 'A9')[0] == 0.5 and S.rival_info(m, 'X', 'A1')[0] == 0.2

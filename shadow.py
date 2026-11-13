@@ -69,12 +69,21 @@ def margin(p, sku):
     return p - f - sku['cost'] - PREP
 
 
-def rival_info(model, seller):
+def rival_info(model, seller, asin=None):
+    """(answer rate, response minutes, listing-specific?) for a rival. The seller's rate over all listings, or, when the model has the rival's
+    record on this listing, that record pulled toward the seller's rate with the weight of `listing_weight` events (Nov 12 check)."""
     r = model['rivals'].get(seller)
     d = model['rival_default']
-    if not r:
-        return d['rate'], d['lag_min'], False
-    return r['rate'], r.get('lag_min') or d['lag_min'], False
+    rate, lag = (r['rate'], r.get('lag_min') or d['lag_min']) if r else (d['rate'], d['lag_min'])
+    pl = (model.get('rival_listing') or {}).get(f'{seller}|{asin}') if asin else None
+    if not pl or not pl.get('n'):
+        return rate, lag, False
+    m = model.get('listing_weight', 10)
+    n = pl['n']
+    rate = (pl['k'] + m * rate) / (n + m)
+    if pl.get('lag_min'):
+        lag = (pl['lag_min'] * n + lag * m) / (n + m)
+    return rate, lag, True
 
 
 def war_penalty_pct(model, rate):
@@ -216,8 +225,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if me_backordered:   # Nick's units aren't available yet: don't compete on price (no cuts), as Seller Snap does; raises still allowed
         cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
     lam = sku['lam']
-    rate = max((rival_info(model, s)[0] for s in near), default=model['rival_default']['rate'])
-    lag = min((rival_info(model, s)[1] for s in near), default=model['rival_default']['lag_min'])
+    rate = max((rival_info(model, s, asin)[0] for s in near), default=model['rival_default']['rate'])
+    lag = min((rival_info(model, s, asin)[1] for s in near), default=model['rival_default']['lag_min'])
     p_now = p_win(model, feats(me, low, n_riv, use_foep, share))
     qty = my_stock if my_stock is not None else (sku.get('qty') or 1)
     qty = max(qty, 1)

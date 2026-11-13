@@ -134,6 +134,7 @@ def bb_next(X, t, dur=1800):
     return win / tot if tot > 0 else None
 # ---------------- per ASIN: rival reactions to undercuts (by anyone), price-war events, and Buy Box training rows
 react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); events = []; R = []
+react_l = collections.defaultdict(lambda: [0, 0]); lags_l = collections.defaultdict(list)   # per (rival, listing)
 for a in ASINS:
     ts, P, W, SP = load_asin(a)
     for i in range(1, len(ts)):
@@ -156,6 +157,8 @@ for a in ASINS:
                 ok = resp.get(x, (False, None))
                 react[x][0] += int(ok[0]); react[x][1] += 1
                 if ok[0]: lags[x].append(ok[1] / 60.0)
+                react_l[(x, a)][0] += int(ok[0]); react_l[(x, a)][1] += 1
+                if ok[0]: lags_l[(x, a)].append(ok[1] / 60.0)
             low24 = None
             if t + 86400 <= T1:
                 k = bisect.bisect_right(ts, t + 86400) - 1
@@ -185,7 +188,11 @@ rival_default = {'rate': round(mu, 4), 'lag_min': round(float(np.median(allags))
 rivals = {}
 for x, (kk, nn) in react.items():
     rivals[x] = {'rate': round((kk + a0) / (nn + a0 + b0), 4), 'n': nn, 'k': kk, 'lag_min': round(float(np.median(lags[x])), 2) if len(lags[x]) >= 3 else None}
-print('rivals', len(rivals), 'pooled rate', rival_default, flush=True)
+# Per listing too: rivals fight hard on some listings and ignore others (Nov 12 check: per-listing rates, pulled toward the seller's,
+# predicted next answers ~10% better than one rate per seller). shadow.rival_info blends them with LISTING_WEIGHT.
+rival_listing = {f'{x}|{a}': {'k': kk, 'n': nn, 'lag_min': round(float(np.median(lags_l[(x, a)])), 2) if lags_l[(x, a)] else None}
+                 for (x, a), (kk, nn) in react_l.items()}
+print('rivals', len(rivals), 'pooled rate', rival_default, 'rival-listing pairs', len(rival_listing), flush=True)
 # ---------------- price-war table
 rows = []
 for at_low, low24 in events:
@@ -222,7 +229,7 @@ rule = (te.me <= te.foep + 0.01).astype(float); val['rule_at_or_below_target'] =
 print('validation (last 2 days held out)', json.dumps(val), flush=True)
 model = {'trained_at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), 'window_days': A.days, 'messages': n_msgs,
          'bb_foep': {'coef': fit(D, True)}, 'bb_nofoep': {'coef': fit(D, False)}, 'validation': val,
-         'rivals': rivals, 'rival_default': rival_default, 'war_table': war, 'bb_rows': int(len(D))}
+         'rivals': rivals, 'rival_default': rival_default, 'rival_listing': rival_listing, 'listing_weight': 10, 'war_table': war, 'bb_rows': int(len(D))}
 # ---------------- safety check: new vs current model on the same held-out days
 def score(coefs, name, wf):
     pred = np.array([S.p_win({name: {'coef': coefs}}, S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share)) for r in te.itertuples()])
