@@ -36,6 +36,8 @@ HEALTH_EVERY = int(os.environ.get('HEALTH_EVERY_S', '86400'))
 KEEPA_EVERY = int(os.environ.get('KEEPA_EVERY_S', '21600'))
 KEEPA_RESERVE = int(os.environ.get('KEEPA_RESERVE', '2500'))  # leave this many tokens for the Lead Score server
 KEEPA_BATCH = 20
+YEAR_EVERY = 7 * 86400 - 4 * 3600   # Keepa year pull: weekly (Nick, Nov 12); the 4 h slack keeps it from drifting a pull later each week
+YEAR_ASINS = {}                      # asin -> last time it was pulled with a year of history
 SP = 'https://sellingpartnerapi-na.amazon.com'
 MP = 'ATVPDKIKX0DER'
 ORDER_COLS = ['amazon-order-id', 'purchase-date', 'last-updated-date', 'order-status', 'fulfillment-channel', 'sales-channel',
@@ -65,7 +67,7 @@ STREAMS = {
     'inventory': ('FBA inventory', 'hourly', 'Fulfillable, reserved, inbound and unfulfillable units for every SKU with stock.'),
     'foep': ('Buy Box target price', 'every 30 min', "Amazon's featured offer expected price (the Buy Box target) for every sellable SKU."),
     'health': ('Account health', 'daily', 'Seller performance report and suppressed listings.'),
-    'keepa': ('Keepa rival stock', 'every 6 h', 'Live offers with stock for in-stock ASINs, full Keepa responses.'),
+    'keepa': ('Keepa rival stock and year of prices', 'every 6 h; a year of history weekly', 'Live offers with stock for in-stock ASINs, full Keepa responses. Once a week (and for a new in-stock ASIN, at its next pull) a year of price history, for the max price rule.'),
     'fees': ('Amazon fees', 'daily per SKU, hourly for new SKUs', "Amazon's own fee estimate for every sellable SKU at a price under $10, $10-$50 and over $50, used by the repricer."),
     'catalog': ('Amazon listing status', 'every 3 h', "Amazon's all-listings report: every SKU on the account with Active / Inactive / Incomplete, so the Repricer page can show each listing's state."),
     'traffic': ('Sales & Traffic', 'daily', "Amazon's Sales & Traffic report for the last 30 days by ASIN (units ordered, Buy Box %, page views): the repricer's sales speed and Buy Box share."),
@@ -516,16 +518,26 @@ def pull_keepa(wait=time.sleep):
         raise RuntimeError('no in-stock ASINs yet')
     t, used, left = now(), 0, None
     path = os.path.join(DATA, 'keepa', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz')
+    yfile = os.path.join(DATA, 'keepa_year_at.json')
     with LOCK:
         if not STATE['keepa'].get('year_at'):   # remembered across restarts, so a deploy doesn't trigger another year pull
             try:
-                STATE['keepa']['year_at'] = json.load(open(os.path.join(DATA, 'keepa_year_at.json')))['t']
+                y = json.load(open(yfile))
+                STATE['keepa']['year_at'] = y['t']; YEAR_ASINS.update(y.get('asins') or {})
             except (OSError, ValueError, KeyError):
                 pass
-        year = time.time() - (STATE['keepa'].get('year_at') or 0) > 20 * 3600   # once a day: a year of history (same tokens) for the max price rule
-    days = 365 if year else 1
-    for i in range(0, len(asins), KEEPA_BATCH):
-        b = asins[i:i + KEEPA_BATCH]
+        year = time.time() - (STATE['keepa'].get('year_at') or 0) > YEAR_EVERY   # weekly: a year of history (same tokens) for the max price rule
+        tried = dict(YEAR_ASINS)
+    # Between weekly pulls, an ASIN with no year of history yet (new listing or restock) gets its year in the next 6-hourly pull,
+    # once a week at most, so its max comes from the year high rather than 2 x min.
+    if year:
+        need = set(asins)
+    else:
+        have = set(SH.fba_high) if SH else set()
+        need = {a for a in asins if a not in have and time.time() - tried.get(a, 0) > YEAR_EVERY}
+    plan = [(sorted(need)[i:i + KEEPA_BATCH], 365) for i in range(0, len(need), KEEPA_BATCH)] + \
+           [(rest[i:i + KEEPA_BATCH], 1) for rest in [[a for a in asins if a not in need]] for i in range(0, len(rest), KEEPA_BATCH)]
+    for b, days in plan:
         for k in range(30):
             if left is not None and left < KEEPA_RESERVE + 200:
                 wait(60)
@@ -544,18 +556,22 @@ def pull_keepa(wait=time.sleep):
         append_gz(path, [json.dumps({'taken_at': iso(), 'asins': b, 'tokensConsumed': j.get('tokensConsumed'), 'tokensLeft': j.get('tokensLeft'), 'response': j})])
         if SH:
             _safe(SH.on_keepa_products, j.get('products'))
+        if days == 365:
+            for a in b:
+                tried[a] = time.time()
         with LOCK:
             STATE['keepa'].update(tokens_used=used, tokens_left=j.get('tokensLeft'))
     with LOCK:
-        STATE['keepa'].update(last=iso(t), asins=len(asins), last_error=None)
+        YEAR_ASINS.update(tried)
+        STATE['keepa'].update(last=iso(t), asins=len(asins), last_error=None, year_new_last=0 if year else len(need))
         if year:
             STATE['keepa']['year_at'] = time.time()
-            try:
-                with open(os.path.join(DATA, 'keepa_year_at.json'), 'w') as f:
-                    json.dump({'t': STATE['keepa']['year_at']}, f)
-            except OSError:
-                pass
             STATE['keepa']['year_last'] = iso(t)
+        try:
+            with open(yfile, 'w') as f:
+                json.dump({'t': STATE['keepa'].get('year_at') or 0, 'asins': tried}, f)
+        except OSError:
+            pass
 
 
 def every(name, seconds, fn, needs):

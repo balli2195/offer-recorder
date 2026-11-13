@@ -220,3 +220,31 @@ def test_next_retrain_is_317_central():
     assert (n.day, n.hour, n.minute) == (13, 3, 17)
     t = dt.datetime(2026, 11, 13, 2, 0, tzinfo=ZoneInfo('America/Chicago')).timestamp()
     assert dt.datetime.fromtimestamp(A.next_retrain(t), ZoneInfo('America/Chicago')).day == 13
+
+
+def test_keepa_year_pull_weekly_and_new_asins(monkeypatch):
+    os.environ['KEEPA_KEY'] = 'kk'
+    A.IN_STOCK = ['Y1', 'Y2', 'Y3']; A.SELLABLE = []
+    calls = []
+    def get(url, timeout, params):
+        calls.append((params['days'], sorted(params['asin'].split(','))))
+        return G(200, {'products': [{'asin': a} for a in params['asin'].split(',')], 'tokensConsumed': 1, 'tokensLeft': 9000})
+    monkeypatch.setattr(A.requests, 'get', get)
+    A.STATE['keepa']['year_at'] = None; A.YEAR_ASINS.clear()
+    yf = os.path.join(A.DATA, 'keepa_year_at.json')
+    if os.path.exists(yf): os.remove(yf)
+    A.SH.fba_high = {}
+    A.pull_keepa(wait=lambda s: None)
+    assert calls == [(365, ['Y1', 'Y2', 'Y3'])]                          # first ever: the weekly year pull
+    A.SH.fba_high = {'Y1': (50.0, 300), 'Y2': (40.0, 300)}                # Y3 had no FBA history
+    calls.clear(); A.pull_keepa(wait=lambda s: None)
+    assert calls == [(1, ['Y1', 'Y2', 'Y3'])]                            # within the week; Y3 was already tried this week
+    A.IN_STOCK = ['Y1', 'Y2', 'Y3', 'N4']                                 # a new in-stock ASIN
+    calls.clear(); A.pull_keepa(wait=lambda s: None)
+    assert calls == [(365, ['N4']), (1, ['Y1', 'Y2', 'Y3'])]
+    A.STATE['keepa']['year_at'] = None                                    # restart: remembered from disk, no new year pull
+    calls.clear(); A.pull_keepa(wait=lambda s: None)
+    assert calls == [(1, ['N4', 'Y1', 'Y2', 'Y3'])]
+    A.STATE['keepa']['year_at'] = time.time() - 7 * 86400                 # a week later
+    calls.clear(); A.pull_keepa(wait=lambda s: None)
+    assert calls == [(365, ['N4', 'Y1', 'Y2', 'Y3'])]
