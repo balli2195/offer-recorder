@@ -23,6 +23,7 @@ U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); ap.add_argument('--upload', action='store_true'); ap.add_argument('--out', default='model.json'); ap.add_argument('--cache', default=None)
 ap.add_argument('--holder', action='store_true', help='also fit the holder models (bb_foep_h / bb_nofoep_h) for moments a rival holds the Buy Box')
 ap.add_argument('--changes', action='store_true', help='also build rows at every change of Nick\'s price (both repricers) and save ch_rows.pkl')
+ap.add_argument('--save-rows', action='store_true', help='test: save the Buy Box rows (bb_rows.pkl) next to --out')
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
 ap.add_argument('--report', default=None, help='write the comparison and the keep/replace verdict here')
@@ -312,6 +313,8 @@ if A.rivals_only:
     __import__('shutil').rmtree(TMP, ignore_errors=True)
     sys.exit(0)
 D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), 'label from', dict(LABEL_SRC), flush=True)
+if A.save_rows:
+    D.to_pickle(os.path.join(os.path.dirname(os.path.abspath(A.out)), 'bb_rows.pkl'))
 if A.changes:
     pd.DataFrame(CH).to_pickle(os.path.join(os.path.dirname(os.path.abspath(A.out)), 'ch_rows.pkl')); print('price-change rows', len(CH), flush=True)
 HOLD = bool(A.holder)
