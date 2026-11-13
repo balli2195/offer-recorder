@@ -22,6 +22,7 @@ ME = S.ME; CAP = 1800
 U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {'X-Recorder-Key': os.environ.get('RECORDER_KEY', '')}
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); ap.add_argument('--upload', action='store_true'); ap.add_argument('--out', default='model.json'); ap.add_argument('--cache', default=None)
 ap.add_argument('--holder', action='store_true', help='also fit the holder models (bb_foep_h / bb_nofoep_h) for moments a rival holds the Buy Box')
+ap.add_argument('--changes', action='store_true', help='also build rows at every change of Nick\'s price (both repricers) and save ch_rows.pkl')
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
 ap.add_argument('--report', default=None, help='write the comparison and the keep/replace verdict here')
@@ -122,6 +123,7 @@ for pth in ([] if A.rivals_only else want('foep')):
         a = (b.get('offerIdentifier') or {}).get('asin')
         if r.get('resultStatus') == 'VALID_FOEP' and a:
             fo[a].append((ts_(x['taken_at']), x['sku'], a, r['featuredOfferExpectedPrice']['listingPrice']['amount']))
+FO_ALL = {a_: sorted(v) for a_, v in fo.items()}   # every reading, for the price-change rows
 # one training moment per SKU per 25 min at most: readings got more frequent on Nov 13 (10-min sweeps + changed listings),
 # and the Buy Box label covers 30 min, so closer readings would mostly repeat the same moment
 for a_ in fo:
@@ -157,7 +159,8 @@ def bb_next(X, t, dur=1800):
         i += 1
     return win / tot if tot > 0 else None
 # ---------------- per ASIN: rival reactions to undercuts (by anyone), price-war events, and Buy Box training rows
-react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); events = []; R = []
+react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); events = []; R = []; CH = []
+STRANDED = (ts_('2026-11-13T16:40:00Z'), ts_('2026-11-13T18:10:00Z'))   # Nick's listings stranded by an account issue: left out
 react_l = collections.defaultdict(lambda: [0, 0]); lags_l = collections.defaultdict(list)   # per (rival, listing)
 for a in ASINS:
     ts, P, W, SP = load_asin(a)
@@ -188,6 +191,27 @@ for a in ASINS:
                 k = bisect.bisect_right(ts, t + 86400) - 1
                 low24 = 100.0 * (min(P[k].values()) / L0 - 1.0) if P[k] else None
             events.append((at_low, low24))
+    if A.changes:   # every change of Nick's own price (his repricer or Seller Snap): what happened in the 30 min after Amazon showed it
+        fa = FO_ALL.get(a) or []; fts = [q[0] for q in fa]
+        for i in range(1, len(ts)):
+            if ME not in P[i] or ME not in P[i - 1] or SP[i] or len(P[i]) < 2: continue
+            p0, p1 = P[i - 1][ME], P[i][ME]
+            if abs(p1 - p0) < 0.01: continue
+            t = ts[i]
+            if t + 1800 > T1 or STRANDED[0] - 1800 <= t <= STRANDED[1]: continue
+            y = bb_next((ts, P, W), t)
+            if y is None: continue
+            k = bisect.bisect_right(fts, t) - 1
+            f, sku = (fa[k][3], fa[k][1]) if k >= 0 and t - fa[k][0] <= 45 * 60 else (None, fa[k][1] if k >= 0 else None)
+            riv_p = {x: q for x, q in P[i].items() if x != ME}; low = min(riv_p.values())
+            w0 = W[i - 1]
+            if ME in w0: hk, hp = 'me', None
+            elif not w0: hk, hp = 'other', None
+            else:
+                hp = min(P[i - 1][x] for x in w0 if x in P[i - 1]); hk = 'above' if hp > low + 0.005 else 'low'
+            mine = lookup(inv.get(sku), t, 2 * 3600) if sku else None; riv = lookup(kp.get(a), t, 8 * 3600)
+            share = mine / (mine + riv) if (mine is not None and riv is not None and mine + riv > 0) else None
+            CH.append(dict(t=t, a=a, y=y, me=p1, frm=p0, low=low, n=len(P[i]) - 1, foep=f, share=share, hk=hk, hp=hp))
     for t, sku, _, f in fo.get(a, ()):
         if t + 1800 > T1: continue
         i = bisect.bisect_right(ts, t) - 1
@@ -244,6 +268,8 @@ if A.rivals_only:
     __import__('shutil').rmtree(TMP, ignore_errors=True)
     sys.exit(0)
 D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), flush=True)
+if A.changes:
+    pd.DataFrame(CH).to_pickle(os.path.join(os.path.dirname(os.path.abspath(A.out)), 'ch_rows.pkl')); print('price-change rows', len(CH), flush=True)
 HOLD = bool(A.holder)
 def fx(r, wf, holder=False):
     x = S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share,
