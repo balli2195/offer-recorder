@@ -152,3 +152,17 @@ def test_brake_state_survives_restart(tmp_path):
 def test_day_is_central_time():
     t = 1762995600   # 2025-11-13 01:00 UTC = 2025-11-12 19:00 Central
     assert L.ct_day(t) == '2025-11-12'
+
+
+def test_waits_for_amazon_to_show_the_last_change(tmp_path, monkeypatch):
+    lv, _ = mk(tmp_path)
+    lv.set_cfg({'enabled': True, 'skus': ['S1'], 'min_interval_s': 0})
+    lv.on_listings([{'sku': 'S1', 'repricing': False}])
+    monkeypatch.setattr(lv, 'send', lambda sku, price, preview=False: (200, {'status': 'ACCEPTED'}, {}))
+    d = dict(D, rec_price=31.0)
+    assert lv.maybe_apply(d)['to'] == 31.0
+    assert lv.plan(d) is None and lv.stats['blocked']['waiting for Amazon to show the last change'] == 1   # offers still show 30.00
+    lv.last_change['S1'] -= 300                                                                             # past the 2-minute floor
+    assert lv.plan(dict(d, my_price=31.0, rec_price=32.0)) == 32.0                                          # now Amazon shows 31.00
+    lv.sent['S1'] = (time.time() - 21 * 60, 30.0, 31.0)
+    assert lv.plan(d) == 31.0                                                                               # gave up waiting after 20 min

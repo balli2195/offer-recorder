@@ -20,6 +20,7 @@ SP = 'https://sellingpartnerapi-na.amazon.com'
 MP = 'ATVPDKIKX0DER'
 ME = 'A2UYRB3AYUMGAJ'
 CT = ZoneInfo('America/Chicago')
+SHOW_WAIT_S = 20 * 60   # longest wait for an accepted change to show up in Amazon's offers before deciding again
 DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s': 600, 'max_per_day': 96,
             'chase_window_min': 30, 'chase_cuts': 2, 'freeze_h': 6.0, 'max_drop_pct': 10.0,
             # decision tuning, used by shadow and live alike; decay_auto = cost of waiting from the store's own return on inventory
@@ -36,6 +37,7 @@ class Live:
         self.lock = threading.Lock()
         self.ptype = {}                      # sku -> productType
         self.last_change = {}                # sku -> time of last applied change
+        self.sent = {}                       # sku -> (time, from, to) of the last accepted change, until Amazon's offers show it
         self.day_count = {}                  # (sku, date) -> changes applied
         self.ss_repricing = {}               # sku -> Seller Snap repricing flag
         self.ab = None                       # abtest.ABTest, set by app.py
@@ -201,6 +203,14 @@ class Live:
         self.observe(d, now)
         if ab is False:   # a test SKU on Seller Snap's day (or the test is a dry run)
             return None
+        snt = self.sent.get(sku)
+        if snt:
+            if abs(d['my_price'] - snt[2]) < 0.005 or now - snt[0] > SHOW_WAIT_S:
+                self.sent.pop(sku, None)           # Amazon now shows the new price (or it's been long enough)
+            else:
+                # Amazon takes a few minutes to show an accepted change in its offer messages; deciding again from the old price
+                # would re-send the same step (seen on the first night: 8 repeats in 20 min)
+                return self._block('waiting for Amazon to show the last change')
         if d.get('action') == 'hold':
             return None
         with self.lock:
@@ -273,6 +283,7 @@ class Live:
                 self.last_change[sku] = now
                 self.day_count[(sku, ct_day(now))] = self.day_count.get((sku, ct_day(now)), 0) + 1
                 self.seen[sku].append((now, new))
+                self.sent[sku] = (now, d['my_price'], new)
                 if new < d['my_price']:
                     self.cuts[sku] = {'t': now, 'price': new, 'low_before': d.get('low_rival'), 'answered': None}
                 else:
