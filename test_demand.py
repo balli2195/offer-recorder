@@ -50,3 +50,14 @@ def test_decide_uses_pace_scaled_by_buy_box_chance():
     tied = S.p_win(MODEL, S.feats(30.0, 30.0, 1))
     assert abs(fast['lam'] - 20.0 / 24 / max(tied, 0.25)) < 1e-3
     assert any('sales pace 20.0/day' in r for r in fast['reasons'])
+
+
+def test_train_stand_in_takes_keepa_products():
+    # tools/train.py builds a bare Shadow (no __init__) and feeds it Keepa products: every attribute on_keepa_products touches must exist
+    import ast, os
+    src = open(os.path.join(os.path.dirname(__file__), 'tools', 'train.py')).read()
+    line = next(l for l in src.splitlines() if 'sh.fba_high = {}' in l)
+    sh = S.Shadow.__new__(S.Shadow); sh.lock = __import__('threading').Lock(); sh.rival_stock = {}
+    exec(line, {'sh': sh})
+    sh.on_keepa_products([{'asin': 'A1', 'monthlySold': 100, 'csv': [None, None, None, [1, 500]], 'categoryTree': [{'name': 'x'}]}])
+    assert 'A1' in sh.demand

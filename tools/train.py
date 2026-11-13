@@ -128,7 +128,7 @@ for pth in ([] if A.rivals_only else want('inventory')):
         for r in x['rows']: inv[r['sellerSku']].append((t, (r.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0))
 kp = collections.defaultdict(list)
 sh = S.Shadow.__new__(S.Shadow); sh.lock = __import__('threading').Lock(); sh.rival_stock = {}
-sh.fba_high = {}; sh.save_state = lambda *a, **k: None; sh.rebuild = lambda: None
+sh.fba_high = {}; sh.demand = {}; sh.save_state = lambda *a, **k: None; sh.rebuild = lambda: None
 for pth in ([] if A.rivals_only else want('keepa')):
     for l in get(pth):
         x = json.loads(l); t = ts_(x['taken_at']); sh.rival_stock = {}
