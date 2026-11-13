@@ -92,8 +92,11 @@ for pth in want('offers'):
         p = json.loads(d['body'])['Payload']['AnyOfferChangedNotification']
         t = ts_(p['OfferChangeTrigger']['TimeOfOfferChange'])
         # FBA new offers available now, plus Nick's own whatever its availability (same rule as shadow.fba_offers)
-        off = [(o['SellerId'], o['ListingPrice']['Amount'] + o['Shipping']['Amount'], bool(o.get('IsBuyBoxWinner'))) for o in p['Offers']
-               if o.get('SubCondition') == 'new' and o.get('IsFulfilledByAmazon') and (o.get('SellerId') == ME or not S.backordered(o))]
+        # 4th field: 1 = competes (FBA available, or Nick's own); 0 = kept only because it is flagged Buy Box winner (FBM or a backordered
+        # FBA offer), so the number of flagged winners is known (Nov 13: 43% of messages flag 2+ winners)
+        off = [(o['SellerId'], o['ListingPrice']['Amount'] + o['Shipping']['Amount'], bool(o.get('IsBuyBoxWinner')),
+                1 if (o.get('IsFulfilledByAmazon') and (o.get('SellerId') == ME or not S.backordered(o))) else 0) for o in p['Offers']
+               if o.get('SubCondition') == 'new' and ((o.get('IsFulfilledByAmazon') and (o.get('SellerId') == ME or not S.backordered(o))) or o.get('IsBuyBoxWinner'))]
         me_bo = any(o.get('SellerId') == ME and S.backordered(o) for o in p['Offers'])
         batch.append((d['message_id'], p['OfferChangeTrigger']['ASIN'], t, json.dumps(off, separators=(',', ':')), int(bool(S.suppression(p)[0] or me_bo))))
         if len(batch) >= 5000:
@@ -112,7 +115,8 @@ def load_asin(a):
     """(times, {seller: price} per message, {Buy Box winners} per message, suppressed/backordered flag per message) for one ASIN."""
     ts, P, W, SP = [], [], [], []
     for t, off, sp in DB.execute('SELECT t, off, supp FROM m WHERE asin = ? ORDER BY t', (a,)):
-        o = json.loads(off); ts.append(t); P.append({x: q for x, q, w in o}); W.append({x for x, q, w in o if w}); SP.append(bool(sp))
+        o = [tuple(z) + (1,) * (4 - len(z)) for z in json.loads(off)]   # rows written before Nov 13 have 3 fields (all competing)
+        ts.append(t); P.append({x: q for x, q, w, c in o if c}); W.append({x for x, q, w, c in o if w}); SP.append(bool(sp))
     return np.array(ts), P, W, SP
 # ---------------- small inputs first: Amazon's target price readings, FBA inventory and Keepa rival stock
 fo = collections.defaultdict(list)
@@ -130,6 +134,28 @@ for a_ in fo:
         if x[0] - last.get(x[1], -1e18) >= 1500:
             kept.append(x); last[x[1]] = x[0]
     fo[a_] = kept
+SEG = {}   # asin -> ([times], [Nick's page-view-weighted featured share])
+_sg = collections.defaultdict(list)
+for pth in ([] if A.rivals_only else want('segments')):
+    for l in get(pth):
+        try:
+            x = json.loads(l)
+        except ValueError:
+            continue
+        b = x.get('body') or {}; a_ = x.get('asin') or b.get('asin')
+        if not a_ or x.get('status') not in (200, None): continue
+        tot = mine_ = 0.0
+        for o in b.get('featuredBuyingOptions') or []:
+            if (o.get('buyingOptionType') or 'New') != 'New': continue
+            for so in o.get('segmentedFeaturedOffers') or []:
+                for sgm in so.get('featuredOfferSegments') or []:
+                    g = (sgm.get('segmentDetails') or {}).get('glanceViewWeightPercentage') or 0.0
+                    tot += g; mine_ += g if so.get('sellerId') == ME else 0.0
+        _sg[a_].append((ts_(x['taken_at']), mine_ / tot if tot > 0 else 0.0))
+for a_, v in _sg.items():
+    v.sort(); SEG[a_] = ([q[0] for q in v], [q[1] for q in v])
+del _sg
+print('segment snapshots', sum(len(v[0]) for v in SEG.values()), 'asins', len(SEG), flush=True)
 inv = collections.defaultdict(list)
 for pth in ([] if A.rivals_only else want('inventory')):
     for l in get(pth):
@@ -149,13 +175,31 @@ def lookup(series, t, max_age):
     if not series: return None
     i = bisect.bisect_right([s[0] for s in series], t) - 1
     return series[i][1] if i >= 0 and t - series[i][0] <= max_age else None
-def bb_next(X, t, dur=1800):
+# The label: Nick's share of the Buy Box over the 30 min after a moment (Nov 13 fix).
+#  1. Amazon's segment snapshots (competitive summary, about every 20 min per ASIN): Nick's page-view-weighted share of the featured
+#     offer across segments (Prime / non-Prime / default x sample ZIP). The mean of the snapshots in the window, when there is one.
+#  2. Otherwise the offer messages, each credited by how many offers it flags as winner: Amazon often flags 2-3 at once, and only one
+#     of them holds the featured offer. Credits measured Nov 12-13 against the snapshots (151,418 matched):
+CREDIT = {1: 0.96, 2: 0.43, 3: 0.17}
+def credit(w):
+    return CREDIT.get(len(w), 0.05) if ME in w else 0.0
+def msg_share(X, t, dur=1800):
     ts, P, W = X; i = max(0, bisect.bisect_right(ts, t) - 1); tot = win = 0
     while i < len(ts) and ts[i] < t + dur:
         nxt = ts[i + 1] if i + 1 < len(ts) else t + dur; seg = max(0, min(nxt, t + dur, ts[i] + CAP) - max(ts[i], t))
-        if ME in P[i]: tot += seg; win += seg * (ME in W[i])
+        if ME in P[i]: tot += seg; win += seg * credit(W[i])
         i += 1
     return win / tot if tot > 0 else None
+LABEL_SRC = collections.Counter()
+def bb_next(X, t, dur=1800, a=None):
+    sg = SEG.get(a) if a else None
+    if sg:
+        j0, j1 = bisect.bisect_left(sg[0], t), bisect.bisect_right(sg[0], t + dur)
+        if j1 > j0:
+            LABEL_SRC['snapshots'] += 1
+            return float(np.mean(sg[1][j0:j1]))
+    LABEL_SRC['messages'] += 1
+    return msg_share(X, t, dur)
 # ---------------- per ASIN: rival reactions to undercuts (by anyone), price-war events, and Buy Box training rows
 react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); events = []; R = []
 react_l = collections.defaultdict(lambda: [0, 0]); lags_l = collections.defaultdict(list)   # per (rival, listing)
@@ -195,16 +239,16 @@ for a in ASINS:
         Pi = P[i]
         if ME not in Pi or len(Pi) < 2: continue
         if SP[i]: continue   # no Buy Box to win: the repricer matches the lowest offer instead (shadow.decide_suppressed)
-        y = bb_next((ts, P, W), t)
+        y = bb_next((ts, P, W), t, a=a)
         if y is None: continue
         me = Pi[ME]; low = min(q for x, q in Pi.items() if x != ME)
         mine = lookup(inv.get(sku), t, 2 * 3600); riv = lookup(kp.get(a), t, 8 * 3600)
         share = mine / (mine + riv) if (mine is not None and riv is not None and mine + riv > 0) else None
-        w = W[i]
+        w = W[i]; wf_ = [x for x in w if x in Pi and x != ME]
         if ME in w: hk, hp = 'me', None
-        elif not w: hk, hp = 'other', None   # the winner isn't an available FBA offer: FBM or backordered
+        elif not wf_: hk, hp = 'other', None   # the winner isn't an available FBA offer: FBM or backordered
         else:
-            hp = min(Pi[x] for x in w); hk = 'above' if hp > low + 0.005 else 'low'
+            hp = min(Pi[x] for x in wf_); hk = 'above' if hp > low + 0.005 else 'low'
         R.append(dict(t=t, a=a, y=y, me=me, low=low, n=len(Pi) - 1, foep=f, share=share, hk=hk, hp=hp))
 DB.close()
 n = np.array([v[1] for v in react.values()]); k_ = np.array([v[0] for v in react.values()])
@@ -243,7 +287,7 @@ if A.rivals_only:
     print('wrote rivals', A.rivals_only, out['events'], 'events', flush=True)
     __import__('shutil').rmtree(TMP, ignore_errors=True)
     sys.exit(0)
-D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), flush=True)
+D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), 'label from', dict(LABEL_SRC), flush=True)
 HOLD = bool(A.holder)
 def fx(r, wf, holder=False):
     x = S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share,
