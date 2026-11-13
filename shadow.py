@@ -34,7 +34,7 @@ def clip(x, lo, hi):
 
 def feats(me, low_rival, n_rivals, foep=None, share=None, holder=None):
     """Feature dict for the Buy Box logistic model. Prices are landed prices; foep is Amazon's target for Nick (or None).
-    holder (optional, Nov 13 test): who holds the Buy Box now, {'kind': 'me' | 'low' (a rival at the lowest price) | 'above' (a rival
+    holder (optional): who holds the Buy Box now, {'kind': 'me' | 'low' (a rival at the lowest price) | 'above' (a rival
     priced above the lowest) | 'other' (an FBM or backordered offer), 'price': the holder's landed price when kind is 'above'}."""
     f = clip(100.0 * (me / low_rival - 1.0), -10, 20)
     x = {'b': 1.0, 'low_neg': max(min(f, 0.0), -1.0), 'low_pos': max(f, 0.0), 'tied': 1.0 if abs(f) <= 0.5 else 0.0,
@@ -57,6 +57,8 @@ def feats(me, low_rival, n_rivals, foep=None, share=None, holder=None):
 
 def p_win(model, x):
     key = 'bb_foep' if 't_ok' in x else 'bb_nofoep'
+    if 'h_other' in x and (key + '_h') in model:   # holder inputs given: a rival holds the Buy Box (see decide)
+        key += '_h'
     m = model[key]
     z = sum(m['coef'].get(k, 0.0) * v for k, v in x.items())
     return 1.0 / (1.0 + math.exp(-clip(z, -30, 30)))
@@ -229,7 +231,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if use_foep:  # small steps only when Amazon's target is known; without it the Buy Box model is much weaker (AUC ~0.72 vs ~0.89)
         cands |= {math.floor(use_foep * 100) / 100.0, round(me * 1.01, 2), round(me * 1.02, 2), round(me * 0.99, 2)}
     # who holds the Buy Box now (used only by a model trained with holder inputs: tools/train.py --holder)
-    use_h = any(k.startswith('h_') for k in ((model.get('bb_foep' if use_foep else 'bb_nofoep') or {}).get('coef') or {}))
+    use_h = ('bb_foep_h' if use_foep else 'bb_nofoep_h') in model   # holder model trained (tools/train.py --holder)
     if winner == ME:
         h_kind, h_price = 'me', None
     elif winner in rivals:
@@ -237,10 +239,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     else:
         h_kind, h_price = 'other', None
     def hold_at(p):
-        if not use_h:
+        # Nick holds it: the plain model, so raises are scored as before. A rival (or FBM/backordered offer) holds it: the holder model,
+        # which, unlike the plain one, isn't ~2.5x too optimistic about what an undercut wins (Nov 13 test).
+        if not use_h or h_kind == 'me':
             return None
-        if h_kind == 'me':
-            return {'kind': 'me'} if p <= me + 0.005 else {'kind': 'low'}   # a raise isn't credited with keeping the Buy Box
         return {'kind': h_kind, 'price': h_price}
     if use_h and h_kind == 'above':   # a rival above the lowest holds it: its price (and a cent under) are worth scoring
         cands |= {round(h_price, 2), round(h_price - 0.01, 2)}

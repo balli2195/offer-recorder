@@ -21,7 +21,7 @@ from sklearn.metrics import roc_auc_score, brier_score_loss
 ME = S.ME; CAP = 1800
 U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {'X-Recorder-Key': os.environ.get('RECORDER_KEY', '')}
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); ap.add_argument('--upload', action='store_true'); ap.add_argument('--out', default='model.json'); ap.add_argument('--cache', default=None)
-ap.add_argument('--holder', action='store_true', help='test: add who holds the Buy Box now as model inputs and report with vs without')
+ap.add_argument('--holder', action='store_true', help='also fit the holder models (bb_foep_h / bb_nofoep_h) for moments a rival holds the Buy Box')
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
 ap.add_argument('--report', default=None, help='write the comparison and the keep/replace verdict here')
@@ -237,48 +237,58 @@ if A.rivals_only:
     sys.exit(0)
 D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), flush=True)
 HOLD = bool(A.holder)
-def fx(r, wf, holder=None):
-    holder = HOLD if holder is None else holder
-    return S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share,
-                   {'kind': r.hk, 'price': None if pd.isna(r.hp) else r.hp} if holder else None)
-def X_of(df, with_foep, holder=None):
-    keys = None; out = []
-    for r in df.itertuples():
-        x = fx(r, with_foep, holder)
-        out.append(x)
+def fx(r, wf, holder=False):
+    x = S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share,
+                {'kind': r.hk, 'price': None if pd.isna(r.hp) else r.hp} if holder else None)
+    if holder:
+        x.pop('h_me', None)   # the holder models only see moments a rival (or an FBM/backordered offer) holds the Buy Box
+    return x
+def X_of(df, with_foep, holder=False):
+    out = [fx(r, with_foep, holder) for r in df.itertuples()]
     keys = sorted(out[0].keys())
     return np.array([[x[k] for k in keys] for x in out]), keys
-def fit(df, with_foep, holder=None):
+def fit(df, with_foep, holder=False):
     X, keys = X_of(df, with_foep, holder); y = df.y.values
     XX = np.vstack([X, X]); yy = np.r_[np.ones(len(y)), np.zeros(len(y))]; ww = np.r_[y, 1 - y] + 1e-6
-    j = keys.index('b'); m = LogisticRegression(C=1.0, max_iter=2000, fit_intercept=False).fit(XX, yy, sample_weight=ww)
+    m = LogisticRegression(C=1.0, max_iter=3000, fit_intercept=False).fit(XX, yy, sample_weight=ww)
     return dict(zip(keys, [float(c) for c in m.coef_[0]]))
+def metrics(coefs, name, df, wf, holder):
+    pred = np.array([S.p_win({name: {'coef': coefs}}, fx(r, wf, holder)) for r in df.itertuples()])
+    yb = (df.y >= 0.5).astype(int)
+    return {'test_rows': int(len(df)), 'auc': round(float(roc_auc_score(yb, pred)), 4), 'brier': round(float(brier_score_loss(yb, pred)), 4),
+            'mean_pred': round(float(pred.mean()), 4), 'mean_actual': round(float(df.y.mean()), 4)}
+# Holder models (Nov 13, Nick): the plain models over-predicted Nick's Buy Box share when a rival held it (18.7% predicted vs 7.6%
+# actual on held-out days, with a target), so undercuts were credited with ~2.5x their real gain. When someone else holds the Buy Box,
+# shadow.decide uses bb_foep_h / bb_nofoep_h, fitted only on those moments; when Nick holds it, the plain models (raises scored as before).
+NOT_ME = lambda df: df[df.hk != 'me']
 cutoff = T1 - 2 * 86400; tr, te = D[D.t < cutoff], D[D.t >= cutoff]
 val = {}
 for name, wf in (('bb_foep', True), ('bb_nofoep', False)):
-    c = fit(tr, wf); pred = np.array([S.p_win({name: {'coef': c}}, fx(r, wf)) for r in te.itertuples()])
-    yb = (te.y >= 0.5).astype(int)
-    val[name] = {'test_rows': int(len(te)), 'auc': round(float(roc_auc_score(yb, pred)), 4), 'brier': round(float(brier_score_loss(yb, pred)), 4),
-                 'mean_pred': round(float(pred.mean()), 4), 'mean_actual': round(float(te.y.mean()), 4)}
+    val[name] = metrics(fit(tr, wf), name, te, wf, False)
+    if HOLD:
+        nm = name + '_h'
+        val[nm] = metrics(fit(NOT_ME(tr), wf, True), nm, NOT_ME(te), wf, True)
+        val[nm]['plain_on_same_rows'] = {k: v for k, v in metrics(fit(tr, wf), name, NOT_ME(te), wf, False).items() if k in ('auc', 'brier', 'mean_pred')}
 rule = (te.me <= te.foep + 0.01).astype(float); val['rule_at_or_below_target'] = {'auc': round(float(roc_auc_score((te.y >= 0.5).astype(int), rule)), 4)}
 print('validation (last 2 days held out)', json.dumps(val), flush=True)
-if HOLD:   # the same rows and split, without the holder inputs, for a like-for-like comparison
-    base = {}
-    for name, wf in (('bb_foep', True), ('bb_nofoep', False)):
-        c = fit(tr, wf, False); pred = np.array([S.p_win({name: {'coef': c}}, fx(r, wf, False)) for r in te.itertuples()])
-        yb = (te.y >= 0.5).astype(int)
-        base[name] = {'auc': round(float(roc_auc_score(yb, pred)), 4), 'brier': round(float(brier_score_loss(yb, pred)), 4), 'mean_pred': round(float(pred.mean()), 4)}
-    print('without holder inputs (same split)', json.dumps(base), flush=True)
-    print('holder mix (test rows)', te.hk.value_counts(normalize=True).round(3).to_dict(), flush=True)
-    D.to_pickle(os.path.join(os.path.dirname(os.path.abspath(A.out)), 'bb_rows.pkl'))
 model = {'trained_at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), 'window_days': A.days, 'messages': n_msgs,
          'bb_foep': {'coef': fit(D, True)}, 'bb_nofoep': {'coef': fit(D, False)}, 'validation': val,
          'rivals': rivals, 'rival_default': rival_default, 'rival_listing': rival_listing, 'listing_weight': 10, 'war_table': war, 'bb_rows': int(len(D))}
+holder_ok = {}
+if HOLD:   # kept only if, on the held-out moments a rival held the Buy Box, it ranks as well as the plain model and predicts the level
+    for name in ('bb_foep', 'bb_nofoep'):
+        v = val[name + '_h']; pv = v['plain_on_same_rows']; why = []
+        if v['test_rows'] < 500: why.append(f"only {v['test_rows']} test rows")
+        if v['auc'] < pv['auc'] - 0.005: why.append(f"AUC {v['auc']:.4f} vs plain {pv['auc']:.4f}")
+        if v['brier'] > pv['brier'] + 0.005: why.append(f"Brier {v['brier']:.4f} vs plain {pv['brier']:.4f}")
+        if abs(v['mean_pred'] - v['mean_actual']) > 0.05: why.append(f"average {v['mean_pred']:.3f} vs actual {v['mean_actual']:.3f}")
+        holder_ok[name + '_h'] = why or 'ok'
+        if not why:
+            model[name + '_h'] = {'coef': fit(NOT_ME(D), name == 'bb_foep', True)}
+    print('holder models', json.dumps(holder_ok), flush=True)
 # ---------------- safety check: new vs current model on the same held-out days
 def score(coefs, name, wf):
-    pred = np.array([S.p_win({name: {'coef': coefs}}, fx(r, wf, any(k.startswith('h_') for k in coefs))) for r in te.itertuples()])
-    yb = (te.y >= 0.5).astype(int)
-    return {'auc': round(float(roc_auc_score(yb, pred)), 4), 'brier': round(float(brier_score_loss(yb, pred)), 4), 'mean_pred': round(float(pred.mean()), 4)}
+    return {k: v for k, v in metrics(coefs, name, te, wf, False).items() if k in ('auc', 'brier', 'mean_pred')}
 cur = None
 try:
     if A.current:
@@ -304,6 +314,7 @@ if c_:
         check['reasons'].append(f"Brier {n_['brier']:.4f} vs current {c_['brier']:.4f}")
 check['verdict'] = 'keep current' if check['reasons'] else 'replace'
 check['current_trained_at'] = (cur or {}).get('trained_at')
+check['holder_models'] = holder_ok
 model['check'] = check
 print('safety check', json.dumps(check), flush=True)
 raw = json.dumps(model); open(A.out, 'w').write(raw); print('wrote', A.out, len(raw), 'bytes')

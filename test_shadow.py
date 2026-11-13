@@ -323,3 +323,17 @@ def test_rival_rate_uses_the_listing_record_pulled_toward_the_seller():
     r, lag, own = S.rival_info(m, 'R', 'A1'); assert own and abs(r - 0.125) < 1e-9 and lag == 10.0     # ignores undercuts on A1
     r, lag, own = S.rival_info(m, 'R', 'A2'); assert abs(r - 0.75) < 1e-9 and abs(lag - 7.0) < 1e-9    # fights on A2, and fast
     assert S.rival_info(m, 'R', 'A9')[0] == 0.5 and S.rival_info(m, 'X', 'A1')[0] == 0.2
+
+
+def test_holder_model_used_only_when_a_rival_holds():
+    hm = dict(MODEL, bb_nofoep_h={'coef': {'b': -2.5, 'low_neg': -0.8, 'tied': 0.2, 'lnriv': -0.3, 'share': 0.5, 'share_na': 0.0,
+                                         'h_other': -0.4, 'h_above': 0.0, 'h_gap_neg': -0.1, 'h_gap_pos': 0.0}})
+    offs = {S.ME: 30.5, 'CALM': 30.0, 'REACT': 31.0}
+    plain = S.decide(MODEL, 'A1', offs, 'REACT', SKU)
+    held_by_rival = S.decide(hm, 'A1', offs, 'REACT', SKU)          # REACT (above the lowest) holds it: holder model, lower chances
+    assert held_by_rival['cur']['p_win'] < plain['cur']['p_win']
+    assert any('Buy Box held by REACT at 31.00' in r for r in held_by_rival['reasons'])
+    mine = S.decide(hm, 'A1', offs, S.ME, SKU)                        # Nick holds it: the plain model, as before
+    assert mine['cur']['p_win'] == S.decide(MODEL, 'A1', offs, S.ME, SKU)['cur']['p_win']
+    x = S.feats(30.0, 30.0, 2, holder={'kind': 'above', 'price': 31.0})
+    assert x['h_above'] == 1.0 and x['h_gap_neg'] < 0 and S.p_win(hm, x) != S.p_win(hm, S.feats(30.0, 30.0, 2))
