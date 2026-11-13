@@ -56,6 +56,7 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None},
          'traffic': {'last': None, 'asins': None, 'last_error': None},
          'limits': {'last': None, 'costs': None, 'overrides': None, 'last_error': None},
+         'rivals': {'last': None, 'seconds': None, 'events': None, 'last_error': None},
          'retrain': {'last': None, 'state': None, 'verdict': None, 'reasons': None, 'new_auc': None, 'current_auc': None, 'seconds': None,
                      'peak_mb': None, 'next': None, 'last_error': None}}
 # What each stream is, for the Hub's system map (GET /components). A new loop needs an entry here and in start().
@@ -72,6 +73,7 @@ STREAMS = {
     'catalog': ('Amazon listing status', 'every 3 h', "Amazon's all-listings report: every SKU on the account with Active / Inactive / Incomplete, so the Repricer page can show each listing's state."),
     'traffic': ('Sales & Traffic', 'daily', "Amazon's Sales & Traffic report for the last 30 days by ASIN (units ordered, Buy Box %, page views): the repricer's sales speed and Buy Box share."),
     'limits': ('Price limits from the Hub', 'hourly (pushed by the Hub)', 'Unit costs (InventoryLab, order ledger, lead cost), min/max overrides (liquidation, manual) and the limit settings, sent by the Hub.'),
+    'rivals': ('Hourly rival refresh', 'hourly', 'Recounts how often and how fast each rival answers undercuts (overall and per listing) and the price-war table from the last 7 days, so new or newly aggressive rivals are learned within the hour.'),
     'retrain': ('Nightly model retraining', 'daily, 3:17 AM Central', 'Refits the Buy Box, rival-reaction and price-war models on the last 7 days of recorded data, in a separate process on this server, and swaps them in only if the new Buy Box model scores at least as well as the current one on the same held-out 2 days.'),
     'abtest': ('Repricer vs Seller Snap test', 'daily switch, 3 AM Central', 'Alternating-day test: groups A and B swap between the repricer and Seller Snap each day, both on Seller Snap\'s min/max; decisions are tagged with their arm.'),
     'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
@@ -683,6 +685,35 @@ def retrain():
         _retrain_lock.release()
 
 
+RIVALS_EVERY = 3600
+
+
+def refresh_rivals():
+    """Hourly: rival answer rates (overall and per listing), response times and the price-war table from the last 7 days of offer
+    messages, so a new or newly aggressive rival is learned within the hour instead of at the nightly training. Same counting as training;
+    keeps its message index on the data disk and reads only new or changed files. Skipped while the nightly training runs."""
+    if _retrain_lock.locked():
+        return {'ok': False, 'error': 'training running'}
+    t0 = time.time()
+    out = os.path.join(DATA, 'model', 'rivals.json')
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        cmd = ['nice', '-n', '15', sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'train.py'),
+               '--local', DATA, '--days', '7', '--rivals-only', out, '--out', os.path.join(DATA, 'model', 'unused.json')]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30 * 60)
+        if r.returncode != 0:
+            raise RuntimeError(f'exit {r.returncode}: {((r.stdout or "") + (r.stderr or ""))[-500:]}')
+        SH.on_rivals()
+        with LOCK:
+            STATE['rivals'].update(last=iso(), seconds=round(time.time() - t0), last_error=None,
+                                   events=(json.load(open(out)).get('events')))
+        return {'ok': True}
+    except Exception as e:
+        with LOCK:
+            STATE['rivals'].update(last_error=f'{iso()} {type(e).__name__}: {str(e)[:300]}', seconds=round(time.time() - t0))
+        return {'ok': False, 'error': str(e)[:300]}
+
+
 def retrain_loop():
     while True:
         nxt = next_retrain()
@@ -938,6 +969,7 @@ def start():
     threading.Thread(target=SH.loop, daemon=True).start()
     threading.Thread(target=retrain_loop, daemon=True).start()
     threading.Thread(target=AB.loop, daemon=True).start()
+    threading.Thread(target=delayed, args=(1200, every, 'rivals', RIVALS_EVERY, refresh_rivals, []), daemon=True).start()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
     threading.Thread(target=segments_loop, daemon=True).start()

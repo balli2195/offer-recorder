@@ -248,3 +248,19 @@ def test_keepa_year_pull_weekly_and_new_asins(monkeypatch):
     A.STATE['keepa']['year_at'] = time.time() - 7 * 86400                 # a week later
     calls.clear(); A.pull_keepa(wait=lambda s: None)
     assert calls == [(365, ['N4', 'Y1', 'Y2', 'Y3'])]
+
+
+def test_rival_refresh_overlays_newer_rival_tables(monkeypatch):
+    import test_shadow as TS, types
+    c = A.app.test_client(); h = {'X-Recorder-Key': 'k'}
+    c.post('/model', data=json.dumps(dict(TS.MODEL, trained_at='2026-11-13T03:17:00+00:00')), headers=h)
+    def fake_run(cmd, **kw):
+        out = cmd[cmd.index('--rivals-only') + 1]
+        json.dump({'updated_at': '2026-11-13T09:00:00+00:00', 'events': 123, 'rivals': {'NEW': {'rate': 0.9, 'n': 5, 'k': 5, 'lag_min': 3.0}},
+                   'rival_default': {'rate': 0.2, 'lag_min': 12.0}, 'rival_listing': {}, 'listing_weight': 10, 'war_table': [[0.1, 0.3], [0.8, 1.3]]}, open(out, 'w'))
+        return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(A.subprocess, 'run', fake_run)
+    assert A.refresh_rivals()['ok'] and A.SH.model['rivals'] == {'NEW': {'rate': 0.9, 'n': 5, 'k': 5, 'lag_min': 3.0}}
+    assert A.STATE['rivals']['events'] == 123
+    c.post('/model', data=json.dumps(dict(TS.MODEL, trained_at='2026-11-14T03:17:00+00:00')), headers=h)   # a newer nightly model wins
+    assert 'NEW' not in A.SH.model['rivals']

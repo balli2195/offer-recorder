@@ -24,6 +24,8 @@ ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); 
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
 ap.add_argument('--report', default=None, help='write the comparison and the keep/replace verdict here')
+ap.add_argument('--rivals-only', default=None, help='hourly: refresh only the rival tables (rates, per listing, war table) into this JSON file;'
+                ' with --local, keeps its message index between runs and reads only new or changed files')
 A = ap.parse_args()
 if A.local:   # on the recorder: scratch space on its data disk (the container's own disk is small), outside the folders it records into
     os.makedirs(os.path.join(A.local, 'tmp'), exist_ok=True)
@@ -70,10 +72,19 @@ def want(kind):
     return [f['path'] for f in files if f['path'].startswith(kind + '/') and f['path'].split('/')[1][:10] >= cut]
 # ---------------- offers: streamed into a temporary on-disk index, then worked through one ASIN at a time, so memory stays small
 # (holding every message in memory took 1.5 GB for 7 days; the recorder server has 512 MB)
-DB = sqlite3.connect(os.path.join(TMP, 'msgs.db')); DB.execute('PRAGMA journal_mode=OFF'); DB.execute('PRAGMA synchronous=OFF')
-DB.execute('CREATE TABLE m (id TEXT PRIMARY KEY, asin TEXT, t REAL, off TEXT, supp INTEGER) WITHOUT ROWID')
+KEEP = bool(A.rivals_only and A.local)   # hourly rival refresh on the recorder: one index kept on the data disk, topped up each hour
+DB = sqlite3.connect(os.path.join(A.local, 'tmp', 'rivals.db') if KEEP else os.path.join(TMP, 'msgs.db'))
+DB.execute('PRAGMA journal_mode=OFF'); DB.execute('PRAGMA synchronous=OFF')
+DB.execute('CREATE TABLE IF NOT EXISTS m (id TEXT PRIMARY KEY, asin TEXT, t REAL, off TEXT, supp INTEGER) WITHOUT ROWID')
+DB.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime REAL)')
+seen_files = dict(DB.execute('SELECT path, mtime FROM files').fetchall()) if KEEP else {}
 n_msgs = 0
 for pth in want('offers'):
+    if KEEP:
+        mt = os.path.getmtime(os.path.join(A.local, pth))
+        if seen_files.get(pth) == mt:
+            continue
+        DB.execute('INSERT OR REPLACE INTO files VALUES (?, ?)', (pth, mt))
     batch = []
     for l in get(pth):
         d = json.loads(l)
@@ -87,8 +98,12 @@ for pth in want('offers'):
         if len(batch) >= 5000:
             DB.executemany('INSERT OR IGNORE INTO m VALUES (?,?,?,?,?)', batch); batch = []
     DB.executemany('INSERT OR IGNORE INTO m VALUES (?,?,?,?,?)', batch)
+if KEEP:   # drop what fell out of the window
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=A.days)).timestamp()
+    DB.execute('DELETE FROM m WHERE t < ?', (old,))
+    DB.execute("DELETE FROM files WHERE substr(path, 8, 10) < ?", (cut,))
 DB.commit()
-DB.execute('CREATE INDEX ma ON m (asin, t)')
+DB.execute('CREATE INDEX IF NOT EXISTS ma ON m (asin, t)')
 n_msgs, T1 = DB.execute('SELECT COUNT(*), MAX(t) FROM m').fetchone()
 ASINS = [r[0] for r in DB.execute('SELECT DISTINCT asin FROM m')]
 print('messages', n_msgs, 'asins', len(ASINS), flush=True)
@@ -100,21 +115,21 @@ def load_asin(a):
     return np.array(ts), P, W, SP
 # ---------------- small inputs first: Amazon's target price readings, FBA inventory and Keepa rival stock
 fo = collections.defaultdict(list)
-for pth in want('foep'):
+for pth in ([] if A.rivals_only else want('foep')):
     for l in get(pth):
         x = json.loads(l); b = x.get('body') or {}; r = (b.get('featuredOfferExpectedPriceResults') or [{}])[0]
         a = (b.get('offerIdentifier') or {}).get('asin')
         if r.get('resultStatus') == 'VALID_FOEP' and a:
             fo[a].append((ts_(x['taken_at']), x['sku'], a, r['featuredOfferExpectedPrice']['listingPrice']['amount']))
 inv = collections.defaultdict(list)
-for pth in want('inventory'):
+for pth in ([] if A.rivals_only else want('inventory')):
     for l in get(pth):
         x = json.loads(l); t = ts_(x['taken_at'])
         for r in x['rows']: inv[r['sellerSku']].append((t, (r.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0))
 kp = collections.defaultdict(list)
 sh = S.Shadow.__new__(S.Shadow); sh.lock = __import__('threading').Lock(); sh.rival_stock = {}
 sh.fba_high = {}; sh.save_state = lambda *a, **k: None; sh.rebuild = lambda: None
-for pth in want('keepa'):
+for pth in ([] if A.rivals_only else want('keepa')):
     for l in get(pth):
         x = json.loads(l); t = ts_(x['taken_at']); sh.rival_stock = {}
         sh.on_keepa_products(x['response'].get('products'))
@@ -205,6 +220,15 @@ for b, g in W_.groupby('bin', observed=True):
     if len(g) >= 30: war.append([round(float(g.r.median()), 4), round(float(max(g['drop'].median(), 0.0)), 4)])
 if len(war) < 2: war = [[0.05, 0.4], [0.85, 3.9]]
 print('war table', war, flush=True)
+if A.rivals_only:
+    out = {'updated_at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), 'window_days': A.days, 'messages': n_msgs,
+           'events': int(sum(v[1] for v in react.values())), 'rivals': rivals, 'rival_default': rival_default, 'rival_listing': rival_listing,
+           'listing_weight': 10, 'war_table': war}
+    tmpf = A.rivals_only + '.tmp'
+    json.dump(out, open(tmpf, 'w')); os.replace(tmpf, A.rivals_only)
+    print('wrote rivals', A.rivals_only, out['events'], 'events', flush=True)
+    __import__('shutil').rmtree(TMP, ignore_errors=True)
+    sys.exit(0)
 D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), flush=True)
 def X_of(df, with_foep):
     keys = None; out = []

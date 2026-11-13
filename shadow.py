@@ -377,6 +377,7 @@ class Shadow:
                 m = json.load(f)
             self.model = m
             self.stats['model_trained_at'] = m.get('trained_at')
+            self._overlay_rivals()
             self.stats['model_info'] = {'validation': m.get('validation'), 'bb_rows': m.get('bb_rows'), 'messages': m.get('messages'),
                                         'window_days': m.get('window_days'), 'rivals': len(m.get('rivals') or {}), 'rival_default': m.get('rival_default'),
                                         'war_table': m.get('war_table')}
@@ -384,6 +385,33 @@ class Shadow:
             self.model = None
         except Exception as e:
             self.stats['last_error'] = f'model load: {e}'
+
+    RIVAL_KEYS = ('rivals', 'rival_default', 'rival_listing', 'listing_weight', 'war_table')
+
+    def rivals_path(self):
+        return os.path.join(self.data, 'model', 'rivals.json')
+
+    def _overlay_rivals(self):
+        """The hourly rival refresh (rivals.json) replaces the model's rival tables when it is newer than the model's training."""
+        try:
+            with open(self.rivals_path()) as f:
+                r = json.load(f)
+        except (OSError, ValueError):
+            return
+        if self.model is None or (r.get('updated_at') or '') <= (self.model.get('trained_at') or ''):
+            return
+        for k in self.RIVAL_KEYS:
+            if k in r:
+                self.model[k] = r[k]
+        self.stats['rivals_updated_at'] = r.get('updated_at')
+        if self.stats.get('model_info'):
+            self.stats['model_info'].update(rivals=len(r.get('rivals') or {}), rival_default=r.get('rival_default'), war_table=r.get('war_table'),
+                                            rivals_updated_at=r.get('updated_at'))
+
+    def on_rivals(self):
+        """Called after the hourly refresh wrote rivals.json."""
+        with self.lock:
+            self._overlay_rivals()
 
     def save_model(self, raw):
         m = json.loads(raw)
