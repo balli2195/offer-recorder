@@ -694,7 +694,8 @@ def retrain():
             if cap:
                 resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
         cmd = ['nice', '-n', '15', sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'train.py'),
-               '--local', DATA, '--days', '7', '--out', cand, '--report', rep] + (['--current', cur] if os.path.exists(cur) else [])
+               '--local', DATA, '--days', '7', '--out', cand, '--report', rep] + (['--current', cur] if os.path.exists(cur) else []) \
+              + (['--holder'] if os.environ.get('RETRAIN_HOLDER', 'on') == 'on' else [])   # holder models for when a rival holds the Buy Box (Nov 13)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=RETRAIN_TIMEOUT, preexec_fn=limit, env=CHILD_ENV)
         peak = round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024)
         tail = (r.stdout or '')[-3000:] + (r.stderr or '')[-2000:]
