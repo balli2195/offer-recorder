@@ -15,6 +15,7 @@ import argparse, bisect, collections, datetime as dt, gzip, io, json, math, os, 
 import numpy as np, pandas as pd, requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import shadow as S
+import ctxfeat as CX
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
@@ -23,6 +24,8 @@ U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); ap.add_argument('--upload', action='store_true'); ap.add_argument('--out', default='model.json'); ap.add_argument('--cache', default=None)
 ap.add_argument('--holder', action='store_true', help='also fit the holder models (bb_foep_h / bb_nofoep_h) for moments a rival holds the Buy Box')
 ap.add_argument('--changes', action='store_true', help='also build rows at every change of Nick\'s price (both repricers) and save ch_rows.pkl')
+ap.add_argument('--v2', action='store_true', help='Nov 13 setup: held label (share until Nick\'s next price change, at most 6 h), boosted trees '
+                'on context inputs (ctxfeat.py) and the post-change model; each kept only if it beats the simpler model on the held-out days')
 ap.add_argument('--save-rows', action='store_true', help='test: save the Buy Box rows (bb_rows.pkl) next to --out')
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
@@ -80,6 +83,9 @@ DB = sqlite3.connect(os.path.join(A.local, 'tmp', 'rivals.db') if KEEP else os.p
 DB.execute('PRAGMA journal_mode=OFF'); DB.execute('PRAGMA synchronous=OFF')
 DB.execute('CREATE TABLE IF NOT EXISTS m (id TEXT PRIMARY KEY, asin TEXT, t REAL, off TEXT, supp INTEGER) WITHOUT ROWID')
 DB.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime REAL)')
+V2 = bool(A.v2 and not KEEP)
+if V2:   # context inputs of every message (ctxfeat.MSG_COLS + the lowest rival), for the trees
+    DB.execute('CREATE TABLE IF NOT EXISTS cx (id TEXT PRIMARY KEY, asin TEXT, t REAL, v BLOB) WITHOUT ROWID')
 seen_files = dict(DB.execute('SELECT path, mtime FROM files').fetchall()) if KEEP else {}
 n_msgs = 0
 for pth in want('offers'):
@@ -88,7 +94,7 @@ for pth in want('offers'):
         if seen_files.get(pth) == mt:
             continue
         DB.execute('INSERT OR REPLACE INTO files VALUES (?, ?)', (pth, mt))
-    batch = []
+    batch = []; cxb = []
     for l in get(pth):
         d = json.loads(l)
         p = json.loads(d['body'])['Payload']['AnyOfferChangedNotification']
@@ -101,15 +107,22 @@ for pth in want('offers'):
                if o.get('SubCondition') == 'new' and ((o.get('IsFulfilledByAmazon') and (o.get('SellerId') == ME or not S.backordered(o))) or o.get('IsBuyBoxWinner'))]
         me_bo = any(o.get('SellerId') == ME and S.backordered(o) for o in p['Offers'])
         batch.append((d['message_id'], p['OfferChangeTrigger']['ASIN'], t, json.dumps(off, separators=(',', ':')), int(bool(S.suppression(p)[0] or me_bo))))
+        if V2:
+            cx_ = CX.message_ctx(p)
+            if cx_ is not None:
+                cxb.append((d['message_id'], p['OfferChangeTrigger']['ASIN'], t, np.array(cx_[0] + [cx_[1]], dtype=np.float32).tobytes()))
         if len(batch) >= 5000:
             DB.executemany('INSERT OR IGNORE INTO m VALUES (?,?,?,?,?)', batch); batch = []
+            if V2: DB.executemany('INSERT OR IGNORE INTO cx VALUES (?,?,?,?)', cxb); cxb = []
     DB.executemany('INSERT OR IGNORE INTO m VALUES (?,?,?,?,?)', batch)
+    if V2: DB.executemany('INSERT OR IGNORE INTO cx VALUES (?,?,?,?)', cxb)
 if KEEP:   # drop what fell out of the window
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=A.days)).timestamp()
     DB.execute('DELETE FROM m WHERE t < ?', (old,))
     DB.execute("DELETE FROM files WHERE substr(path, 8, 10) < ?", (cut,))
 DB.commit()
 DB.execute('CREATE INDEX IF NOT EXISTS ma ON m (asin, t)')
+if V2: DB.execute('CREATE INDEX IF NOT EXISTS cxa ON cx (asin, t)')
 n_msgs, T1 = DB.execute('SELECT COUNT(*), MAX(t) FROM m').fetchone()
 ASINS = [r[0] for r in DB.execute('SELECT DISTINCT asin FROM m')]
 print('messages', n_msgs, 'asins', len(ASINS), flush=True)
@@ -207,8 +220,32 @@ def bb_next(X, t, dur=1800, a=None):
 react = collections.defaultdict(lambda: [0, 0]); lags = collections.defaultdict(list); events = []; R = []; CH = []
 STRANDED = (ts_('2026-11-13T16:40:00Z'), ts_('2026-11-13T18:10:00Z'))   # Nick's listings stranded by an account issue: left out
 react_l = collections.defaultdict(lambda: [0, 0]); lags_l = collections.defaultdict(list)   # per (rival, listing)
+HELD_MAX = 6 * 3600
+def held_label(a, t, oc):
+    """Nick's page-view share from t until his next price change (oc: his change times on the listing), at most 6 h; None when the
+    window has no segment snapshot, runs past the data, or touches the stranded window. Tested Nov 13 (BUYBOX_ROTATION_AND_LABEL_WINDOW):
+    as accurate as 30 min on the share while a price stands, without diluting the price effect as a fixed 6-h window does."""
+    k = bisect.bisect_right(oc, t + 1)
+    end = min(t + HELD_MAX, oc[k] if k < len(oc) else float('inf'))
+    if end > T1 or (t <= STRANDED[1] and end >= STRANDED[0]):
+        return None
+    sg = SEG.get(a)
+    if not sg:
+        return None
+    j0, j1 = bisect.bisect_left(sg[0], t), bisect.bisect_right(sg[0], end)
+    return float(np.mean(sg[1][j0:j1])) if j1 > j0 else None
+NANV = [float('nan')] * (len(CX.MSG_COLS) + len(CX.ROLL_COLS))
 for a in ASINS:
     ts, P, W, SP = load_asin(a)
+    if V2:
+        cxr = DB.execute('SELECT t, v FROM cx WHERE asin = ? ORDER BY t', (a,)).fetchall()
+        ctt = np.array([q[0] for q in cxr]); cv = np.array([np.frombuffer(q[1], dtype=np.float32) for q in cxr]) if cxr else np.zeros((0, 21))
+        cM, cL = (cv[:, :-1], cv[:, -1]) if len(cv) else (cv, cv)
+        oc = [ts[i] for i in range(1, len(ts)) if ME in P[i] and ME in P[i - 1] and abs(P[i][ME] - P[i - 1][ME]) >= 0.01]
+        def ctx_of(t, n_riv, hk, strict):
+            i = int(np.searchsorted(ctt, t, side='left' if strict else 'right')) - 1
+            v = CX.vector_at(ctt, cM, cL, i, t, n_riv, hk) if len(ctt) else None
+            return v if v is not None else NANV + CX.hold_cols(hk)
     for i in range(1, len(ts)):
         P0, P1 = P[i - 1], P[i]
         if len(P1) < 2: continue
@@ -236,7 +273,7 @@ for a in ASINS:
                 k = bisect.bisect_right(ts, t + 86400) - 1
                 low24 = 100.0 * (min(P[k].values()) / L0 - 1.0) if P[k] else None
             events.append((at_low, low24))
-    if A.changes:   # every change of Nick's own price (his repricer or Seller Snap): what happened in the 30 min after Amazon showed it
+    if A.changes or V2:   # every change of Nick's own price (his repricer or Seller Snap): what happened in the 30 min after Amazon showed it
         fa = FO_ALL.get(a) or []; fts = [q[0] for q in fa]
         for i in range(1, len(ts)):
             if ME not in P[i] or ME not in P[i - 1] or SP[i] or len(P[i]) < 2: continue
@@ -256,7 +293,12 @@ for a in ASINS:
                 hp = min(P[i - 1][x] for x in wf0); hk = 'above' if hp > low + 0.005 else 'low'
             mine = lookup(inv.get(sku), t, 2 * 3600) if sku else None; riv = lookup(kp.get(a), t, 8 * 3600)
             share = mine / (mine + riv) if (mine is not None and riv is not None and mine + riv > 0) else None
-            CH.append(dict(t=t, a=a, y=y, me=p1, frm=p0, low=low, n=len(P[i]) - 1, foep=f, share=share, hk=hk, hp=hp))
+            row = dict(t=t, a=a, y=y, me=p1, frm=p0, low=low, n=len(P[i]) - 1, foep=f, share=share, hk=hk, hp=hp)
+            if V2:
+                row['y'] = held_label(a, t, oc)
+                if row['y'] is None: continue
+                row['cx'] = ctx_of(t, len(P[i]) - 1, hk, True)   # the message before the change: its flags don't show the result
+            CH.append(row)
     for t, sku, _, f in fo.get(a, ()):
         if t + 1800 > T1: continue
         i = bisect.bisect_right(ts, t) - 1
@@ -274,7 +316,12 @@ for a in ASINS:
         elif not wf_: hk, hp = 'other', None   # the winner isn't an available FBA offer: FBM or backordered
         else:
             hp = min(Pi[x] for x in wf_); hk = 'above' if hp > low + 0.005 else 'low'
-        R.append(dict(t=t, a=a, y=y, me=me, low=low, n=len(Pi) - 1, foep=f, share=share, hk=hk, hp=hp))
+        row = dict(t=t, a=a, y=y, me=me, low=low, n=len(Pi) - 1, foep=f, share=share, hk=hk, hp=hp)
+        if V2:
+            row['y'] = held_label(a, t, oc)
+            if row['y'] is None: continue
+            row['cx'] = ctx_of(t, len(Pi) - 1, hk, False)
+        R.append(row)
 DB.close()
 n = np.array([v[1] for v in react.values()]); k_ = np.array([v[0] for v in react.values()])
 m5 = n >= 5; pr = (k_[m5] / n[m5]) if m5.any() else np.array([0.3])
@@ -367,6 +414,79 @@ if HOLD:   # kept only if, on the held-out moments a rival held the Buy Box, it 
         if not why:
             model[name + '_h'] = {'coef': fit(NOT_ME(D), name == 'bb_foep', True)}
     print('holder models', json.dumps(holder_ok), flush=True)
+# ---------------- Nov 13 setup (--v2): boosted trees on context inputs, and the post-change model
+# Trees start from the logistic's log-odds and see no price inputs (ctxfeat.FEATURES), so the price response stays the logistic's.
+# The post-change model scores prices other than the current one (shadow.decide); fitted on every change of Nick's price.
+# Each part is kept only if, on the held-out last 2 days, it has a lower mean squared error on the held share than the simpler
+# model it would replace, and its average is within 5 points of what happened. Tested Nov 13: BUYBOX_HEAD_TO_HEAD_2026-11-13.md.
+V2_REPORT = {}
+try:
+    import lightgbm as lgb
+except Exception as e:   # no LightGBM: the plain and holder models are still trained; trees and the post-change model are skipped
+    lgb = None; V2_REPORT['error'] = f'lightgbm: {type(e).__name__}: {e}'
+if V2 and lgb is not None and len(D) > 2000:
+    TREE_PARAMS = dict(objective='cross_entropy', learning_rate=0.03, num_leaves=15, min_data_in_leaf=300, feature_fraction=0.8,
+                       bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0, verbose=-1, seed=7, num_threads=1)
+    zlin = lambda c, x: sum(c.get(k, 0.0) * v for k, v in x.items())
+    sigm = lambda z: 1 / (1 + np.exp(-np.clip(z, -30, 30)))
+    def base_z(rows, wf, cp, ch):   # the live split: plain model when Nick is flagged, holder model otherwise
+        return np.array([zlin(cp, fx(r, wf, False)) if (r.hk == 'me' or ch is None) else zlin(ch, fx(r, wf, True)) for r in rows.itertuples()])
+    def chfx(r, wf):
+        x = S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share, {'kind': r.hk, 'price': None if pd.isna(r.hp) else r.hp})
+        x.update(S.change_terms(r.me, r.frm, x.get('h_me', 0.0)))
+        return x
+    def fit_ch(rows, wf):
+        xs = [chfx(r, wf) for r in rows.itertuples()]; keys = sorted(xs[0]); X = np.array([[x[k] for k in keys] for x in xs]); y = rows.y.values
+        m = LogisticRegression(C=1.0, max_iter=3000, fit_intercept=False).fit(np.vstack([X, X]), np.r_[np.ones(len(y)), np.zeros(len(y))], sample_weight=np.r_[y, 1 - y] + 1e-6)
+        return dict(zip(keys, [float(c) for c in m.coef_[0]]))
+    Xof = lambda rows: np.array(rows.cx.tolist(), dtype=np.float32)
+    def tree(rows_fit, z_fit, rows_va=None, z_va=None, rounds=None):
+        d = lgb.Dataset(Xof(rows_fit), rows_fit.y.values, init_score=z_fit, feature_name=CX.FEATURES, free_raw_data=True)
+        if rounds is None:
+            v = lgb.Dataset(Xof(rows_va), rows_va.y.values, init_score=z_va, reference=d)
+            return lgb.train(TREE_PARAMS, d, 2000, valid_sets=[v], callbacks=[lgb.early_stopping(100, verbose=False)])
+        return lgb.train(TREE_PARAMS, d, max(int(rounds), 1))
+    mse = lambda p, y: float(np.mean((p - y) ** 2))
+    def judge(name, p_new, p_old, y):
+        why = []
+        if len(y) < 500: why.append(f'only {len(y)} test rows')
+        if mse(p_new, y) >= mse(p_old, y): why.append(f'MSE {mse(p_new, y):.4f} not below {mse(p_old, y):.4f}')
+        if abs(float(p_new.mean()) - float(y.mean())) > 0.05: why.append(f'average {p_new.mean():.3f} vs actual {y.mean():.3f}')
+        V2_REPORT[name] = {'test_rows': int(len(y)), 'mse_new': round(mse(p_new, y), 4), 'mse_old': round(mse(p_old, y), 4),
+                           'mean_new': round(float(p_new.mean()), 4), 'mean_old': round(float(p_old.mean()), 4), 'mean_actual': round(float(y.mean()), 4),
+                           'kept': not why, 'why_not': why}
+        return not why
+    vcut = cutoff - 86400
+    CHD = pd.DataFrame(CH)
+    for name, wf in (('foep', True), ('nofoep', False)):
+        dsel = (lambda df: df[df.foep.notna()]) if wf else (lambda df: df)
+        # ordinary moments: tree on top of the plain/holder logistic
+        Dw = dsel(D); trw, tew = Dw[Dw.t < cutoff], Dw[Dw.t >= cutoff]; fw, vw = trw[trw.t < vcut], trw[trw.t >= vcut]
+        cp_f = fit(fw, wf); ch_f = fit(NOT_ME(fw), wf, True) if ('bb_' + name + '_h') in model else None
+        b = tree(fw, base_z(fw, wf, cp_f, ch_f), vw, base_z(vw, wf, cp_f, ch_f))
+        z_te = base_z(tew, wf, cp_f, ch_f)
+        if judge('tree_' + name, sigm(z_te + b.predict(Xof(tew), raw_score=True)), sigm(z_te), tew.y.values):
+            cp_all = model['bb_' + name]['coef']; ch_all = (model.get('bb_' + name + '_h') or {}).get('coef')
+            bf = tree(Dw, base_z(Dw, wf, cp_all, ch_all), rounds=b.best_iteration)
+            model['tree_' + name] = {'booster': bf.model_to_string(), 'features': CX.FEATURES, 'rounds': int(b.best_iteration)}
+        # price changes: post-change logistic (vs the ordinary model at the new price), then its tree
+        if len(CHD) < 2000: continue
+        Cw = dsel(CHD); ctr, cte = Cw[Cw.t < cutoff], Cw[Cw.t >= cutoff]; cfw, cvw = ctr[ctr.t < vcut], ctr[ctr.t >= vcut]
+        cp_t = fit(dsel(tr), wf); ch_t = fit(NOT_ME(dsel(tr)), wf, True) if ('bb_' + name + '_h') in model else None
+        cc_t = fit_ch(ctr, wf)
+        z_cc = np.array([zlin(cc_t, chfx(r, wf)) for r in cte.itertuples()])
+        if judge('bb_change_' + name, sigm(z_cc), sigm(base_z(cte, wf, cp_t, ch_t)), cte.y.values):
+            model['bb_change_' + name] = {'coef': fit_ch(Cw, wf)}
+            cc_f = fit_ch(cfw, wf)
+            zc = lambda rows, c: np.array([zlin(c, chfx(r, wf)) for r in rows.itertuples()])
+            bc = tree(cfw, zc(cfw, cc_f), cvw, zc(cvw, cc_f))
+            z2 = zc(cte, cc_f)
+            if judge('tree_change_' + name, sigm(z2 + bc.predict(Xof(cte), raw_score=True)), sigm(z2), cte.y.values):
+                bcf = tree(Cw, zc(Cw, model['bb_change_' + name]['coef']), rounds=bc.best_iteration)
+                model['tree_change_' + name] = {'booster': bcf.model_to_string(), 'features': CX.FEATURES, 'rounds': int(bc.best_iteration)}
+    model['label'] = 'held: page-view share until the next own price change, at most 6 h'
+    model['v2'] = V2_REPORT
+    print('v2 models', json.dumps(V2_REPORT), flush=True)
 # ---------------- safety check: new vs current model on the same held-out days
 def score(coefs, name, wf):
     return {k: v for k, v in metrics(coefs, name, te, wf, False).items() if k in ('auc', 'brier', 'mean_pred')}
@@ -396,6 +516,7 @@ if c_:
 check['verdict'] = 'keep current' if check['reasons'] else 'replace'
 check['current_trained_at'] = (cur or {}).get('trained_at')
 check['holder_models'] = holder_ok
+check['v2'] = {k: {kk: v[kk] for kk in ('kept', 'mse_new', 'mse_old', 'test_rows')} for k, v in V2_REPORT.items()}
 model['check'] = check
 print('safety check', json.dumps(check), flush=True)
 raw = json.dumps(model); open(A.out, 'w').write(raw); print('wrote', A.out, len(raw), 'bytes')

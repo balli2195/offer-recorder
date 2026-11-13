@@ -13,6 +13,7 @@ Model: model.json written by tools/train.py (Buy Box logistic models, per-rival 
 import json, math, os, statistics, threading, time, collections, datetime as dt
 import fees as _fees
 import demand as DM
+import ctxfeat as CX
 import limits as L
 
 ME = 'A2UYRB3AYUMGAJ'
@@ -56,13 +57,27 @@ def feats(me, low_rival, n_rivals, foep=None, share=None, holder=None):
     return x
 
 
-def p_win(model, x):
+def z_win(model, x):
+    """Log-odds of Nick's Buy Box share from the logistic models (see p_win)."""
     key = 'bb_foep' if 't_ok' in x else 'bb_nofoep'
     if 'h_other' in x and (key + '_h') in model:   # holder inputs given: a rival holds the Buy Box (see decide)
         key += '_h'
-    m = model[key]
-    z = sum(m['coef'].get(k, 0.0) * v for k, v in x.items())
+    return sum(model[key]['coef'].get(k, 0.0) * v for k, v in x.items())
+
+
+def sigmoid(z):
     return 1.0 / (1.0 + math.exp(-clip(z, -30, 30)))
+
+
+def p_win(model, x):
+    return sigmoid(z_win(model, x))
+
+
+def change_terms(new, old, h_me):
+    """Inputs of the post-change model besides the Buy Box model's (Nov 13): raise or cut, step size (%, capped at 10), and their mixes."""
+    up = 1.0 if new > old + 0.005 else 0.0
+    step = min(abs(new / old - 1.0) * 100.0, 10.0) if old else 0.0
+    return {'c_raise': up, 'c_raise_me': up * h_me, 'c_step': step, 'c_step_raise': step * up}
 
 
 # ---------------------------------------------------------------- economics
@@ -197,7 +212,7 @@ def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None, me_bac
 
 
 def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=None, rival_stock=None, rival_floor_hit=None, tune=None,
-           suppressed=False, low_any=None, low_ch=None, me_backordered=False, rivals_backordered=0, bb_price=None):
+           suppressed=False, low_any=None, low_ch=None, me_backordered=False, rivals_backordered=0, bb_price=None, boosters=None, ctx_fn=None):
     """offers: {seller: landed price} for FBA new offers on the listing; winner: Buy Box seller id or None.
     sku: dict with sku, min, max, cost, fixed_fee, lam (units per Buy Box hour). Returns a decision dict or None.
     suppressed: Amazon shows no Buy Box on the listing; then the price matches the lowest offer instead (decide_suppressed)."""
@@ -254,13 +269,34 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     cands = sorted({round(clip(c, lo, hi), 2) for c in cands})
     if me_backordered:   # Nick's units aren't available yet: don't compete on price (no cuts), as Seller Snap does; raises still allowed
         cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
+    # Nov 13 setup: the current price is scored by the Buy Box model + its boosted tree (context only, no price inputs); any other
+    # price by the post-change model + its tree. Missing parts (model without them, or no context yet) fall back to the logistic alone.
+    fk = 'foep' if use_foep else 'nofoep'
+    chg = model.get('bb_change_' + fk)
+    t_ord = t_chg = 0.0; parts = []
+    if boosters and ctx_fn:
+        hk_ = 'me' if winner == ME else h_kind
+        v = ctx_fn(n_riv, hk_)
+        if v is not None:
+            if ('tree_' + fk) in boosters:
+                t_ord = float(boosters['tree_' + fk].predict([v], raw_score=True)[0]); parts.append('tree')
+            if chg and ('tree_change_' + fk) in boosters:
+                t_chg = float(boosters['tree_change_' + fk].predict([v], raw_score=True)[0]); parts.append('change tree')
+    if chg:
+        parts.append('post-change model')
+    def P(p, low_, changed):
+        if changed and chg:
+            x = feats(p, low_, n_riv, use_foep, share, {'kind': h_kind, 'price': h_price})
+            x.update(change_terms(p, me, x.get('h_me', 0.0)))
+            return sigmoid(sum(chg['coef'].get(k, 0.0) * v for k, v in x.items()) + t_chg)
+        return sigmoid(z_win(model, feats(p, low_, n_riv, use_foep, share, hold_at(p))) + t_ord)
     lam = sku['lam']
     if sku.get('pace_day'):   # sales-model pace (demand.py): the units/day when priced level with the lowest rival; scale by the Buy Box chance at each price
-        pw_ref = p_win(model, feats(low, low, n_riv, use_foep, share, hold_at(low)))
+        pw_ref = P(low, low, False)
         lam = sku['pace_day'] / 24.0 / max(pw_ref, 0.25)
     rate = max((rival_info(model, s, asin)[0] for s in near), default=model['rival_default']['rate'])
     lag = min((rival_info(model, s, asin)[1] for s in near), default=model['rival_default']['lag_min'])
-    p_now = p_win(model, feats(me, low, n_riv, use_foep, share, hold_at(me)))
+    p_now = P(me, low, False)
     qty = my_stock if my_stock is not None else (sku.get('qty') or 1)
     qty = max(qty, 1)
     daily_now = lam * 24.0 * p_now
@@ -274,10 +310,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     for p in cands:
         m = margin(p, sku)
         f_p, ref = fee(p, sku)
-        pw_alone = p_win(model, feats(p, low, n_riv, use_foep, share, hold_at(p)))
+        pw_alone = P(p, low, abs(p - me) >= 0.005)
         pen = 0.0
         if p < low - 0.005 and p < me - 0.005:  # a new cut below the rivals: they may follow after their lag; then we are tied at p
-            pw_tied = p_win(model, feats(p, p, n_riv, use_foep, share, hold_at(p)))
+            pw_tied = P(p, p, True)
             fl = min(lag / 60.0 / HORIZON_H, 1.0)
             pw = (1 - rate) * pw_alone + rate * (fl * pw_alone + (1 - fl) * pw_tied)
             pen = war_penalty_pct(model, rate) / 100.0 * low * (1 - ref_low) * exposed
@@ -334,7 +370,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
             'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered,
-            'pace_day': sku.get('pace_day'), 'd2': sku.get('d2')}
+            'pace_day': sku.get('pace_day'), 'd2': sku.get('d2'), 'bb_parts': parts}
 
 
 def _num(v):
@@ -402,6 +438,8 @@ class Shadow:
         self.pending = collections.OrderedDict()
         self.last_decided = {}
         self.model = None
+        self.boosters = {}          # name -> lightgbm Booster (tree_foep, tree_nofoep, tree_change_*), built from the model's strings
+        self.cx = CX.Live()         # per-listing context for the trees, from the offer messages
         self.on_decision = None
         self.tune_fn = None      # returns the tuning dict (live config), so settings live in one place
         self.ab = None           # abtest.ABTest while the alternating-day test runs (set by app.py)
@@ -418,7 +456,9 @@ class Shadow:
             with open(self.model_path()) as f:
                 m = json.load(f)
             self.model = m
+            self.boosters = self._boosters(m)
             self.stats['model_trained_at'] = m.get('trained_at')
+            self.stats['model_parts'] = sorted(k for k in m if k.startswith(('bb_', 'tree_')) and k != 'bb_rows')
             self._overlay_rivals()
             self.stats['model_info'] = {'validation': m.get('validation'), 'bb_rows': m.get('bb_rows'), 'messages': m.get('messages'),
                                         'window_days': m.get('window_days'), 'rivals': len(m.get('rivals') or {}), 'rival_default': m.get('rival_default'),
@@ -427,6 +467,23 @@ class Shadow:
             self.model = None
         except Exception as e:
             self.stats['last_error'] = f'model load: {e}'
+
+    def _boosters(self, m):
+        out = {}
+        names = [k for k in m if k.startswith('tree_') and isinstance(m[k], dict) and m[k].get('booster')]
+        if not names:
+            return out
+        try:
+            import lightgbm as lgb
+        except Exception as e:   # no LightGBM: decisions use the logistic models alone
+            self.stats['last_error'] = f'lightgbm: {type(e).__name__}: {e}'
+            return out
+        for k in names:
+            if m[k].get('features') != CX.FEATURES:
+                self.stats['last_error'] = f'{k}: feature list differs from ctxfeat.FEATURES; not used'
+                continue
+            out[k] = lgb.Booster(model_str=m[k]['booster'])
+        return out
 
     RIVAL_KEYS = ('rivals', 'rival_default', 'rival_listing', 'listing_weight', 'war_table')
 
@@ -475,6 +532,10 @@ class Shadow:
             except Exception:
                 continue
             a = p['OfferChangeTrigger']['ASIN']
+            try:
+                self.cx.add(a, dt.datetime.fromisoformat(p['OfferChangeTrigger']['TimeOfOfferChange'].replace('Z', '+00:00')).timestamp(), p)
+            except Exception:
+                pass
             offs, win, me_bo, n_bo = fba_offers(p)
             sup, low_any, low_ch = suppression(p)
             bbp = [x for x in (p.get('Summary') or {}).get('BuyBoxPrices') or [] if (x.get('condition') or x.get('Condition') or '').lower() == 'new']
@@ -969,7 +1030,8 @@ class Shadow:
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
                       suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'),
                       me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0),
-                      bb_price=None if ab else ex.get('bb_price'))   # in the test, no raising the max to a rival's Buy Box (Seller Snap doesn't)
+                      bb_price=None if ab else ex.get('bb_price'),
+                      boosters=self.boosters, ctx_fn=lambda n, hk: self.cx.vector(asin, time.time(), n, hk))   # in the test, no raising the max to a rival's Buy Box (Seller Snap doesn't)
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""

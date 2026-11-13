@@ -5,3 +5,4 @@ requests==2.32.3
 numpy==2.2.6
 pandas==2.2.3
 scikit-learn==1.6.1
+lightgbm==4.7.0
