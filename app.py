@@ -567,7 +567,7 @@ def every(name, seconds, fn, needs):
 
 
 RETRAIN_AT = (3, 17)          # Central time
-RETRAIN_TIMEOUT = 75 * 60
+RETRAIN_TIMEOUT = int(os.environ.get('RETRAIN_TIMEOUT_MIN', '180')) * 60   # the first run on Starter (0.5 CPU) needed over 75 min
 RETRAIN_NEED_MB = int(os.environ.get('RETRAIN_NEED_MB', '300'))   # a 7-day run peaked at 340 MB locally (Nov 12); the child is capped at the free memory, so a tight run fails on its own
 _retrain_lock = threading.Lock()
 
@@ -609,6 +609,10 @@ def retrain():
         for f in (cand, rep):
             if os.path.exists(f):
                 os.remove(f)
+        tmp = os.path.join(DATA, 'tmp')   # scratch left by a run that was stopped (timeout or restart)
+        for n in (os.listdir(tmp) if os.path.isdir(tmp) else []):
+            if n.startswith('train_'):
+                shutil.rmtree(os.path.join(tmp, n), ignore_errors=True)
         room = mem_headroom_mb()
         if room is not None and room < RETRAIN_NEED_MB:
             raise RuntimeError(f'not enough memory to train: {room} MB free in the container, a run needs about {RETRAIN_NEED_MB} MB')
