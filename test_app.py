@@ -275,3 +275,14 @@ def test_repricer_history_endpoint():
     assert d['asin'] == 'HX1' and len(d['points']) == 1 and d['sellers'][A._shadow.ME]['me'] and d['arms'] == []
     assert c.get('/repricer/history?asin=HX1').status_code == 401
     assert c.get('/repricer/history', headers=h).status_code == 400
+
+
+def test_order_units_skips_cancelled_and_other_channels():
+    import json as _j
+    rows = [{'purchase-date': '2026-11-13T10:00:00+00:00', 'order-status': 'Shipped', 'sales-channel': 'Amazon.com', 'sku': 'S1', 'quantity': '2'},
+            {'purchase-date': '2026-11-13T11:00:00+00:00', 'order-status': 'Cancelled', 'sales-channel': 'Amazon.com', 'sku': 'S1', 'quantity': '1'},
+            {'purchase-date': '2026-11-13T11:00:00+00:00', 'order-status': 'Pending', 'sales-channel': 'Non-Amazon', 'sku': 'S1', 'quantity': '1'},
+            {'purchase-date': 'bad', 'order-status': 'Pending', 'sales-channel': 'Amazon.com', 'sku': 'S2', 'quantity': '1'}]
+    out = A.order_units([_j.dumps(r) for r in rows])
+    import datetime as _dt
+    assert out == {'S1': [(_dt.datetime(2026, 11, 13, 10, tzinfo=_dt.timezone.utc).timestamp(), 2)]}

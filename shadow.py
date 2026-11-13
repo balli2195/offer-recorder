@@ -12,6 +12,7 @@ Model: model.json written by tools/train.py (Buy Box logistic models, per-rival 
 """
 import json, math, os, statistics, threading, time, collections, datetime as dt
 import fees as _fees
+import demand as DM
 import limits as L
 
 ME = 'A2UYRB3AYUMGAJ'
@@ -225,6 +226,9 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if me_backordered:   # Nick's units aren't available yet: don't compete on price (no cuts), as Seller Snap does; raises still allowed
         cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
     lam = sku['lam']
+    if sku.get('pace_day'):   # sales-model pace (demand.py): the units/day when priced level with the lowest rival; scale by the Buy Box chance at each price
+        pw_ref = p_win(model, feats(low, low, n_riv, use_foep, share))
+        lam = sku['pace_day'] / 24.0 / max(pw_ref, 0.25)
     rate = max((rival_info(model, s, asin)[0] for s in near), default=model['rival_default']['rate'])
     lag = min((rival_info(model, s, asin)[1] for s in near), default=model['rival_default']['lag_min'])
     p_now = p_win(model, feats(me, low, n_riv, use_foep, share))
@@ -280,6 +284,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     reasons.append(f'lowest rival {low:.2f} ({low_s}), reactive rate {rate:.0%}')
     if share is not None:
         reasons.append(f'stock share {share:.0%}')
+    if sku.get('pace_day'):
+        reasons.append(f"sales pace {sku['pace_day']:.1f}/day level with the lowest rival (sales model, listing demand {sku.get('d2', 0):g}/day)")
     if lo > low:
         reasons.append('floor above lowest rival')
     if raised:
@@ -296,7 +302,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
-            'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered}
+            'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered,
+            'pace_day': sku.get('pace_day'), 'd2': sku.get('d2')}
 
 
 def _num(v):
@@ -355,6 +362,9 @@ class Shadow:
         self.limits = {}            # from the Hub (POST /limits): settings, costs, overrides
         self.fba_high = {}          # asin -> (highest lowest-FBA price in the past year, days of FBA history), from Keepa
         self.traffic = {}           # asin -> {units, bb, pv} over the last 30 days (Amazon Sales & Traffic)
+        self.demand = {}            # asin -> {d2 (listing units/day), bracket, rank, root, nvar, t} from Keepa (demand.py)
+        self.orders = {}            # sku -> [(epoch, units)] over the last 8 days, from the recorder's 30-minute order pulls
+        self.k_pace = None          # pooled scale of the sales-model pace, fitted on Nick's recent sales
         self.traffic_t = None
         self.load_state()
         self.pending = collections.OrderedDict()
@@ -456,7 +466,7 @@ class Shadow:
         return os.path.join(self.data, 'limits', name)
 
     def load_state(self):
-        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic')):
+        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic'), ('demand.json', 'demand')):
             try:
                 with open(self.state_path(name)) as f:
                     v = json.load(f)
@@ -486,6 +496,16 @@ class Shadow:
         self.rebuild()
         return {'costs': len(lim['costs'].get('sku') or {}), 'overrides': len(lim['overrides'])}
 
+    def on_orders(self, by_sku):
+        """by_sku: {sku: [(epoch, units)]} for the last 8 days (cancelled orders left out)."""
+        with self.lock:
+            self.orders = {k: list(v) for k, v in by_sku.items()}
+        self.rebuild()
+
+    def units_since(self, sku, t):
+        with self.lock:
+            return sum(q for tt, q in self.orders.get(sku) or [] if tt >= t)
+
     def on_traffic(self, by_asin):
         with self.lock:
             self.traffic = by_asin
@@ -501,6 +521,7 @@ class Shadow:
         with self.lock:
             cat, inv, ss, lim = dict(self.catalog), dict(self.inv), dict(self.ss_rows), dict(self.limits)
             fees_by, fba_med, fh, tr = dict(self.fees), self.fba_median, dict(self.fba_high), dict(self.traffic)
+            dmd, orders = dict(self.demand), dict(self.orders)
         st = {**LIMIT_DEFAULTS, **(lim.get('settings') or {})}
         PREP = float(st['prep'])
         ov, costs = lim.get('overrides') or {}, lim.get('costs') or {}
@@ -561,6 +582,7 @@ class Shadow:
                          'ss_min': r.get('min_price'), 'ss_max': r.get('max_price'), 'ss_cost': r.get('cost'),
                          'year_high': (fh.get(asin) or (None, None))[0], 'year_days': (fh.get(asin) or (None, None))[1],
                          'year_fba_high': (tuple(fh.get(asin) or ()) + (None,) * 4)[2], 'year_bb_high': (tuple(fh.get(asin) or ()) + (None,) * 4)[3]}
+        self.set_pace(out, inv, dmd, orders)
         rate = self.own_capital_return(out, inv, cat, costs, fees_by, fba_med) if (tr and costs) else capital_return(list(ss.values()))
         with self.lock:
             self.listings = out
@@ -569,6 +591,43 @@ class Shadow:
                 self.stats['capital'] = rate
             self.stats['limits'] = {'priced': len(out), 'skipped': dict(miss), 'sources': dict(src), 'hub_sent_at': lim.get('sent_at'),
                                     'year_highs': len(fh), 'traffic_asins': len(tr), 'settings': st}
+
+    def set_pace(self, out, inv, dmd, orders, now=None):
+        """Sales pace per listing the way Nick's sales model does it (demand.py): k x g(stock / D2) x sqrt(D2) x tier, with k fitted on
+        his own recent sales across SKUs, then each SKU's own sales blended in. Own sales: the last 7 days of orders once the 30-minute
+        order pulls have loaded, else Amazon's 30-day Sales & Traffic units. Listings without a Keepa D2 keep the old pace (lam)."""
+        now = now or time.time()
+        use_orders = bool(orders)
+        rows, own = [], {}
+        for asin, x in out.items():
+            d = (dmd.get(asin) or {}).get('d2')
+            iv = inv.get(x['sku']) or {}
+            S = (iv.get('fulfillable') or 0) + (iv.get('reserved') or 0) + (iv.get('inbound') or 0)
+            if not S:
+                S = x.get('qty') or 0
+            if use_orders:
+                u, days = sum(q for t, q in orders.get(x['sku']) or [] if t >= now - 7 * 86400), 7.0
+            else:
+                u, days = x['v30'] * 30.0, 30.0
+            own[asin] = (d, S, u, days)
+            if d and S > 0 and u > 0:
+                rows.append((u / days, S, d))
+        k = DM.fit_k(rows) if len(rows) >= 20 else None
+        with self.lock:
+            self.k_pace = k
+            self.stats['pace'] = {'k': round(k, 4) if k else None, 'fit_skus': len(rows), 'own_sales': '7-day orders' if use_orders else '30-day Sales & Traffic',
+                                  'with_d2': sum(1 for v in own.values() if v[0])}
+        if not k:
+            return
+        for asin, x in out.items():
+            d, S, u, days = own[asin]
+            if not d:
+                continue
+            prior = k * DM.shape(max(S, 1), d)
+            x['pace_day'] = round(DM.pace(k, S, d, u, days), 4)
+            x['pace_prior'] = round(prior, 4)
+            x['d2'] = d
+            x['src']['pace'] = f"sales model (D2 {d:g}/day) + {'7-day orders' if use_orders else '30-day sales'}"
 
     def own_capital_return(self, listings, inv, cat, costs, fees_by, fba_med):
         """Cost of waiting from Nick's own numbers: profit a day (30-day units x profit per unit at the current price) over the
@@ -785,6 +844,16 @@ class Shadow:
             self.foep[sku] = (time.time(), v)
 
     def on_keepa_products(self, products):
+        dm = {}
+        for p in products or []:
+            x = DM.from_keepa(p)
+            if x:
+                dm[p['asin']] = dict(x, t=time.time())
+        if dm:
+            with self.lock:
+                self.demand.update(dm)
+                d = dict(self.demand)
+            self.save_state('demand.json', d)
         highs = {}
         for p in products or []:
             cs = p.get('csv') or []

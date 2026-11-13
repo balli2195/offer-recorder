@@ -94,16 +94,16 @@ def live_ready(tmp_path, **cfg):
 
 
 def test_chased_cuts_pause_cuts_but_not_raises(tmp_path):
-    lv, _ = live_ready(tmp_path, chase_cuts=2, chase_window_min=30, max_drop_pct=50)
+    lv, _ = live_ready(tmp_path, chase_cuts=2, chase_window_min=30, max_drop_pct=50, max_cut_abs=5)   # whole-dollar cuts: the chase brake, not inching
     t = time.time()
     lv.maybe_apply(dict(CUT))                                   # cut 30 -> 29
     lv.observe(dict(CUT, my_price=29.0, low_rival=29.0), t + 300)  # a rival matched within 5 min
     assert lv.streak['S1'] == 1 and 'S1' not in lv.frozen
-    lv.last_change['S1'] = t - 1000
+    lv.last_change['S1'] = lv.last_cut['S1'] = t - 3600
     lv.maybe_apply(dict(CUT, my_price=29.0, rec_price=28.0, low_rival=29.0))  # cut again 29 -> 28
     lv.observe(dict(CUT, my_price=28.0, low_rival=27.99), t + 600)           # answered again
     assert 'S1' in lv.frozen and 'S1' in lv.stats['frozen']
-    lv.last_change['S1'] = t - 1000
+    lv.last_change['S1'] = lv.last_cut['S1'] = t - 3600
     assert lv.plan(dict(CUT, my_price=28.0, rec_price=27.5, low_rival=27.99)) is None
     assert lv.stats['blocked']['cuts paused: chased by a rival'] == 1
     assert lv.plan(dict(CUT, action='raise', my_price=28.0, rec_price=29.0, low_rival=29.5)) == 29.0   # raises still allowed
@@ -128,7 +128,7 @@ def test_matching_the_low_is_not_counted_as_chased(tmp_path):
 
 
 def test_daily_drop_limit(tmp_path):
-    lv, _ = live_ready(tmp_path, max_drop_pct=10, max_step_pct=10)
+    lv, _ = live_ready(tmp_path, max_drop_pct=10, max_step_pct=10, max_cut_abs=5)
     now = time.time()
     lv.seen['S1'].append((now - 3600, 33.0))                    # was 33.00 an hour ago
     assert lv.plan(dict(CUT, my_price=30.0, rec_price=27.0), now) == 29.7   # floor = 33 x 0.90
@@ -166,3 +166,28 @@ def test_waits_for_amazon_to_show_the_last_change(tmp_path, monkeypatch):
     assert lv.plan(dict(d, my_price=31.0, rec_price=32.0)) == 32.0                                          # now Amazon shows 31.00
     lv.sent['S1'] = (time.time() - 21 * 60, 30.0, 31.0)
     assert lv.plan(d) == 31.0                                                                               # gave up waiting after 20 min
+
+
+def test_cuts_inch_down_5_cents_then_wait_for_buy_box_or_sale(tmp_path):
+    lv, _ = live_ready(tmp_path, max_drop_pct=50)
+    sig = {'held': False, 'sold': 0}
+    lv.signals = lambda sku, asin, since: (sig['held'], sig['sold'])
+    t = time.time()
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91), t) == 26.95          # at most 5 cents per cut, even for a big target
+    lv.last_cut['S1'] = lv.last_change['S1'] = t - 10 * 60
+    assert lv.plan(dict(CUT, my_price=26.95, rec_price=25.91), t) is None          # 30 min after a cut before the next one
+    assert lv.stats['blocked']['waiting 30 min after the last cut'] == 1
+    lv.last_cut['S1'] = lv.last_change['S1'] = t - 31 * 60
+    sig['sold'] = 2
+    assert lv.plan(dict(CUT, my_price=26.95, rec_price=25.91), t) is None          # it sold: hold the price
+    sig['sold'], sig['held'] = 0, True
+    assert lv.plan(dict(CUT, my_price=26.95, rec_price=25.91), t) is None          # held the Buy Box: hold
+    assert lv.stats['blocked']['Buy Box or a sale in the last 30 min: no cut'] == 2
+    sig['held'] = False
+    assert lv.plan(dict(CUT, my_price=26.95, rec_price=25.91), t) == 26.90         # nothing in 30 min: next 5-cent step
+    assert lv.plan(dict(CUT, action='raise', my_price=26.90, rec_price=27.5, low_rival=27.6), t) == 27.5   # raises aren't limited
+    lv.set_cfg({'max_cut_abs': 0.10, 'cut_wait_min': 60})
+    lv.last_cut['S1'] = t - 45 * 60
+    assert lv.plan(dict(CUT, my_price=26.90, rec_price=25.91), t) is None          # settable: 60-minute wait
+    lv.last_cut['S1'] = t - 61 * 60
+    assert lv.plan(dict(CUT, my_price=26.90, rec_price=25.91), t) == 26.80         # settable: 10-cent step

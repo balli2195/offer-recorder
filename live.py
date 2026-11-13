@@ -23,6 +23,9 @@ CT = ZoneInfo('America/Chicago')
 SHOW_WAIT_S = 20 * 60   # longest wait for an accepted change to show up in Amazon's offers before deciding again
 DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s': 600, 'max_per_day': 96,
             'chase_window_min': 30, 'chase_cuts': 2, 'freeze_h': 6.0, 'max_drop_pct': 10.0,
+            # inching down (Nick, Nov 13): each cut at most max_cut_abs dollars, then wait cut_wait_min and cut again only if, in that
+            # window, Nick neither held the Buy Box nor sold a unit. Raises are not limited by this.
+            'max_cut_abs': 0.05, 'cut_wait_min': 30,
             # decision tuning, used by shadow and live alike; decay_auto = cost of waiting from the store's own return on inventory
             'decay_per_day': 0.003, 'decay_auto': True, 'min_gain_abs': 0.50, 'min_gain_rel': 0.05}
 
@@ -45,6 +48,8 @@ class Live:
         self.cuts = {}                       # sku -> last applied cut {t, price, low_before, answered}
         self.streak = {}                     # sku -> answered cuts in a row
         self.frozen = {}                     # sku -> {until (epoch), why}
+        self.last_cut = {}                   # sku -> time of the last applied cut (kept through raises, unlike cuts)
+        self.signals = None                  # fn(sku, asin, since) -> (held_buy_box, units_sold), set by app.py
         self.stats = {'env_live_mode': os.environ.get('LIVE_MODE', 'off'), 'enabled': False, 'skus': 0, 'applied': 0,
                       'blocked': {}, 'last_applied': None, 'last_error': None}
         self.cfg = self.load_cfg()
@@ -81,6 +86,8 @@ class Live:
         c['chase_cuts'] = int(min(max(c['chase_cuts'], 1), 5))
         c['freeze_h'] = float(min(max(c['freeze_h'], 0.5), 48.0))
         c['max_drop_pct'] = float(min(max(c['max_drop_pct'], 1.0), 50.0))
+        c['max_cut_abs'] = round(float(min(max(c['max_cut_abs'], 0.01), 5.0)), 2)
+        c['cut_wait_min'] = int(min(max(c['cut_wait_min'], 5), 240))
         c['decay_auto'] = bool(c['decay_auto'])
         c['decay_per_day'] = float(min(max(c['decay_per_day'], 0.0), 0.02))
         c['min_gain_abs'] = float(min(max(c['min_gain_abs'], 0.0), 50.0))
@@ -135,6 +142,7 @@ class Live:
                 self.seen[sku].append((t, r['to']))
             if r['to'] < r['from']:
                 self.cuts[sku] = {'t': t, 'price': r['to'], 'low_before': r.get('low_rival'), 'answered': False}
+                self.last_cut[sku] = max(self.last_cut.get(sku, 0), t)
         self._frozen_stats()
 
     def _frozen_stats(self):
@@ -227,6 +235,14 @@ class Live:
             self._frozen_stats()
             if sku in self.frozen:
                 return self._block('cuts paused: chased by a rival')
+            wait = self.cfg['cut_wait_min'] * 60
+            if now - self.last_cut.get(sku, 0) < wait:
+                return self._block(f"waiting {self.cfg['cut_wait_min']} min after the last cut")
+            if self.signals:
+                held, sold = self.signals(sku, d.get('asin'), now - wait)
+                if held or sold:
+                    return self._block(f"Buy Box or a sale in the last {self.cfg['cut_wait_min']} min: no cut")
+            new = max(new, round(me - self.cfg['max_cut_abs'], 2))
             high = max([p for _, p in self.seen[sku]] + [me])
             floor = math.ceil(high * (1 - self.cfg['max_drop_pct'] / 100.0) * 100 - 1e-6) / 100.0
             if new < floor:
@@ -286,6 +302,7 @@ class Live:
                 self.sent[sku] = (now, d['my_price'], new)
                 if new < d['my_price']:
                     self.cuts[sku] = {'t': now, 'price': new, 'low_before': d.get('low_rival'), 'answered': None}
+                    self.last_cut[sku] = now
                 else:
                     self.cuts.pop(sku, None)
                     self.streak[sku] = 0

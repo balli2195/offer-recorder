@@ -111,6 +111,13 @@ class History:
             self.db.commit()
         self.stats['backfill'] = n
 
+    def held(self, asin, since, me):
+        """Did seller `me` hold the Buy Box at any moment since `since`? (The last message before the window gives the state at its start.)"""
+        with self.lock:
+            prev = self.db.execute('SELECT winner FROM h WHERE asin = ? AND t < ? ORDER BY t DESC LIMIT 1', (asin, since)).fetchone()
+            hit = self.db.execute('SELECT 1 FROM h WHERE asin = ? AND t >= ? AND winner = ? LIMIT 1', (asin, since, me)).fetchone()
+        return bool(hit) or bool(prev and prev[0] == me)
+
     def query(self, asin, hours=48, me=None):
         """Change points only: a row is kept when any offer's price, its presence, or the Buy Box winner changed."""
         since = time.time() - hours * 3600

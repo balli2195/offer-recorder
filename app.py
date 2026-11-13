@@ -4,7 +4,7 @@ Four loops write gzip JSONL to the Render disk:
   listings/ Seller Snap listing snapshot, hourly, through the Seller Snap box (read action only)
   segments/ Amazon's Featured Offer breakdown and reference prices (competitive summary: CompetitivePrice = the outside price above
             which Amazon suppresses the Buy Box, WasPrice) for every in-stock ASIN, one call per 31 s, about 15 min a sweep
-  orders/   Amazon all-orders report, daily, last 8 days, with customer location columns removed
+  orders/   Amazon all-orders report, last 8 days, pulled every 30 min (one file per day, replaced each pull), customer location columns removed
   inventory/ Amazon FBA inventory summaries (fulfillable, reserved, inbound, unfulfillable), hourly, every SKU with any quantity
   foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
   health/   daily seller performance report (account status, metrics) and suppressed-listings report
@@ -28,7 +28,7 @@ KEY = os.environ.get('RECORDER_KEY', '')
 MIN_FREE = float(os.environ.get('MIN_FREE_FRAC', '0.05'))
 SEG_GAP = float(os.environ.get('SEG_GAP_S', '31'))  # Amazon's limit for this call is 0.033 requests/second
 SNAP_EVERY = int(os.environ.get('SNAP_EVERY_S', '3600'))
-ORDER_EVERY = int(os.environ.get('ORDER_EVERY_S', '86400'))
+ORDER_EVERY = int(os.environ.get('ORDER_EVERY_S', '1800'))   # every 30 min: the repricer's 'a sale since the last cut?' check and its sales pace (Nick, Nov 13)
 INV_EVERY = int(os.environ.get('INV_EVERY_S', '3600'))
 FOEP_EVERY = int(os.environ.get('FOEP_EVERY_S', '1800'))
 FOEP_GAP = float(os.environ.get('FOEP_GAP_S', '31'))  # Amazon's limit for the FOEP batch call is 0.033 requests/second, 40 SKUs a call
@@ -129,10 +129,10 @@ def save_batch(msgs):
     t = now()
     lines = [json.dumps({'received_at': iso(t), 'message_id': m['MessageId'], 'sent_ms': (m.get('Attributes') or {}).get('SentTimestamp'), 'body': m['Body']}) for m in msgs]
     append_gz(os.path.join(DATA, 'offers', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
+    if HI:   # first, so the repricer's 'held the Buy Box lately?' check sees this batch
+        _safe(HI.add, [m['Body'] for m in msgs])
     if SH:
         _safe(SH.on_message_bodies, [m['Body'] for m in msgs])
-    if HI:
-        _safe(HI.add, [m['Body'] for m in msgs])
 
 
 def poll_once(sqs):
@@ -221,6 +221,15 @@ except Exception:   # the chart index is a convenience; recording never depends 
     log.exception('history index')
     HI = None
 SH.ab = LV.ab = AB
+
+
+def cut_signals(sku, asin, since):
+    """For live.py's inching rule: did Nick hold the Buy Box (offer messages) or sell a unit (30-minute order pulls) since `since`?"""
+    held = bool(HI and asin and HI.held(asin, since, _shadow.ME))
+    return held, SH.units_since(sku, since)
+
+
+LV.signals = cut_signals
 SH.tune_fn = lambda: LV.cfg
 FE = _fees.Fees(DATA, append_gz, iso, sp_token, on_fees=SH.on_fees)
 FEES_EVERY = int(os.environ.get('FEES_EVERY_S', '3600'))
@@ -310,6 +319,26 @@ def strip_orders(tsv):
     return out
 
 
+def order_units(lines):
+    """{sku: [(epoch, units)]} from stripped order lines: Amazon.com orders, cancelled ones left out."""
+    out = {}
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+            if (r.get('order-status') or '').lower() == 'cancelled' or (r.get('item-status') or '').lower() == 'cancelled':
+                continue
+            if (r.get('sales-channel') or 'Amazon.com') != 'Amazon.com' or not r.get('sku'):
+                continue
+            q = int(r.get('quantity') or 0)
+            if q <= 0:
+                continue
+            t = dt.datetime.fromisoformat(r['purchase-date'].replace('Z', '+00:00')).timestamp()
+            out.setdefault(r['sku'], []).append((t, q))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return out
+
+
 def run_report(report_type, start=None, end=None, options=None, wait=time.sleep):
     """Requests one Amazon report, waits for it, and returns the document bytes (unzipped)."""
     h = {'x-amz-access-token': sp_token(), 'content-type': 'application/json'}
@@ -350,7 +379,8 @@ def pull_orders():
     end = now()
     b = run_report('GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL', end - dt.timedelta(days=8), end - dt.timedelta(minutes=5))
     lines = strip_orders(b.decode('latin-1'))
-    write_once(os.path.join(DATA, 'orders', end.strftime('%Y-%m-%d') + '.jsonl.gz'), lines)
+    write_once(os.path.join(DATA, 'orders', end.strftime('%Y-%m-%d') + '.jsonl.gz'), lines)   # one file per day, replaced by each pull
+    _safe(SH.on_orders, order_units(lines))
     with LOCK:
         STATE['orders'].update(last=iso(), rows=len(lines), last_error=None)
 
