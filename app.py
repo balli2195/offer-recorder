@@ -517,6 +517,11 @@ def pull_keepa(wait=time.sleep):
     t, used, left = now(), 0, None
     path = os.path.join(DATA, 'keepa', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz')
     with LOCK:
+        if not STATE['keepa'].get('year_at'):   # remembered across restarts, so a deploy doesn't trigger another year pull
+            try:
+                STATE['keepa']['year_at'] = json.load(open(os.path.join(DATA, 'keepa_year_at.json')))['t']
+            except (OSError, ValueError, KeyError):
+                pass
         year = time.time() - (STATE['keepa'].get('year_at') or 0) > 20 * 3600   # once a day: a year of history (same tokens) for the max price rule
     days = 365 if year else 1
     for i in range(0, len(asins), KEEPA_BATCH):
@@ -545,6 +550,11 @@ def pull_keepa(wait=time.sleep):
         STATE['keepa'].update(last=iso(t), asins=len(asins), last_error=None)
         if year:
             STATE['keepa']['year_at'] = time.time()
+            try:
+                with open(os.path.join(DATA, 'keepa_year_at.json'), 'w') as f:
+                    json.dump({'t': STATE['keepa']['year_at']}, f)
+            except OSError:
+                pass
             STATE['keepa']['year_last'] = iso(t)
 
 

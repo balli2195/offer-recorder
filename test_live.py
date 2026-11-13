@@ -41,8 +41,7 @@ def test_interval_and_daily_cap(tmp_path):
     lv.last_change['S1'] = now - 60
     assert lv.plan(D, now) is None and lv.stats['blocked']['too soon since last change'] == 1
     lv.last_change['S1'] = now - 3600
-    import datetime as dt
-    lv.day_count[('S1', dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime('%Y-%m-%d'))] = 1
+    lv.day_count[('S1', L.ct_day(now))] = 1   # the cap counts Central-time days
     assert lv.plan(D, now) is None and lv.stats['blocked']['daily change cap'] == 1
 
 def test_patch_keeps_other_offer_fields(tmp_path):
