@@ -32,8 +32,10 @@ def clip(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def feats(me, low_rival, n_rivals, foep=None, share=None):
-    """Feature dict for the Buy Box logistic model. Prices are landed prices; foep is Amazon's target for Nick (or None)."""
+def feats(me, low_rival, n_rivals, foep=None, share=None, holder=None):
+    """Feature dict for the Buy Box logistic model. Prices are landed prices; foep is Amazon's target for Nick (or None).
+    holder (optional, Nov 13 test): who holds the Buy Box now, {'kind': 'me' | 'low' (a rival at the lowest price) | 'above' (a rival
+    priced above the lowest) | 'other' (an FBM or backordered offer), 'price': the holder's landed price when kind is 'above'}."""
     f = clip(100.0 * (me / low_rival - 1.0), -10, 20)
     x = {'b': 1.0, 'low_neg': max(min(f, 0.0), -1.0), 'low_pos': max(f, 0.0), 'tied': 1.0 if abs(f) <= 0.5 else 0.0,
          'above1': 1.0 if f > 1.0 else 0.0, 'lnriv': math.log(max(n_rivals, 1))}
@@ -44,6 +46,12 @@ def feats(me, low_rival, n_rivals, foep=None, share=None):
     if foep is not None and foep > 0:
         g = clip(100.0 * (me / foep - 1.0), -10, 20)
         x.update({'t_neg': max(min(g, 0.0), -1.0), 't_pos': max(g, 0.0), 't_ok': 1.0 if g <= 0.01 else 0.0})
+    if holder is not None:
+        k = holder.get('kind')
+        x.update({'h_me': 1.0 if k == 'me' else 0.0, 'h_other': 1.0 if k == 'other' else 0.0, 'h_above': 0.0, 'h_gap_neg': 0.0, 'h_gap_pos': 0.0})
+        if k == 'above' and holder.get('price'):
+            h = clip(100.0 * (me / holder['price'] - 1.0), -10, 20)
+            x.update({'h_above': 1.0, 'h_gap_neg': max(min(h, 0.0), -5.0), 'h_gap_pos': max(h, 0.0)})
     return x
 
 
@@ -220,6 +228,22 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         cands.add(hi)
     if use_foep:  # small steps only when Amazon's target is known; without it the Buy Box model is much weaker (AUC ~0.72 vs ~0.89)
         cands |= {math.floor(use_foep * 100) / 100.0, round(me * 1.01, 2), round(me * 1.02, 2), round(me * 0.99, 2)}
+    # who holds the Buy Box now (used only by a model trained with holder inputs: tools/train.py --holder)
+    use_h = any(k.startswith('h_') for k in ((model.get('bb_foep' if use_foep else 'bb_nofoep') or {}).get('coef') or {}))
+    if winner == ME:
+        h_kind, h_price = 'me', None
+    elif winner in rivals:
+        h_price = rivals[winner]; h_kind = 'above' if h_price > low + 0.005 else 'low'
+    else:
+        h_kind, h_price = 'other', None
+    def hold_at(p):
+        if not use_h:
+            return None
+        if h_kind == 'me':
+            return {'kind': 'me'} if p <= me + 0.005 else {'kind': 'low'}   # a raise isn't credited with keeping the Buy Box
+        return {'kind': h_kind, 'price': h_price}
+    if use_h and h_kind == 'above':   # a rival above the lowest holds it: its price (and a cent under) are worth scoring
+        cands |= {round(h_price, 2), round(h_price - 0.01, 2)}
     if me <= low - 0.005:  # Nick alone at the low: the next offer minus a cent is a raise candidate
         cands |= {round(low - 0.01, 2)}
     cands = sorted({round(clip(c, lo, hi), 2) for c in cands})
@@ -227,11 +251,11 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
     lam = sku['lam']
     if sku.get('pace_day'):   # sales-model pace (demand.py): the units/day when priced level with the lowest rival; scale by the Buy Box chance at each price
-        pw_ref = p_win(model, feats(low, low, n_riv, use_foep, share))
+        pw_ref = p_win(model, feats(low, low, n_riv, use_foep, share, hold_at(low)))
         lam = sku['pace_day'] / 24.0 / max(pw_ref, 0.25)
     rate = max((rival_info(model, s, asin)[0] for s in near), default=model['rival_default']['rate'])
     lag = min((rival_info(model, s, asin)[1] for s in near), default=model['rival_default']['lag_min'])
-    p_now = p_win(model, feats(me, low, n_riv, use_foep, share))
+    p_now = p_win(model, feats(me, low, n_riv, use_foep, share, hold_at(me)))
     qty = my_stock if my_stock is not None else (sku.get('qty') or 1)
     qty = max(qty, 1)
     daily_now = lam * 24.0 * p_now
@@ -245,10 +269,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     for p in cands:
         m = margin(p, sku)
         f_p, ref = fee(p, sku)
-        pw_alone = p_win(model, feats(p, low, n_riv, use_foep, share))
+        pw_alone = p_win(model, feats(p, low, n_riv, use_foep, share, hold_at(p)))
         pen = 0.0
         if p < low - 0.005 and p < me - 0.005:  # a new cut below the rivals: they may follow after their lag; then we are tied at p
-            pw_tied = p_win(model, feats(p, p, n_riv, use_foep, share))
+            pw_tied = p_win(model, feats(p, p, n_riv, use_foep, share, hold_at(p)))
             fl = min(lag / 60.0 / HORIZON_H, 1.0)
             pw = (1 - rate) * pw_alone + rate * (fl * pw_alone + (1 - fl) * pw_tied)
             pen = war_penalty_pct(model, rate) / 100.0 * low * (1 - ref_low) * exposed
@@ -277,6 +301,8 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     reasons = []
     if winner == ME:
         reasons.append('holding Buy Box')
+    elif h_kind == 'above':
+        reasons.append(f'Buy Box held by {winner} at {h_price:.2f}, above the lowest rival')
     if use_foep:
         reasons.append(f'target {use_foep:.2f} ({(me / use_foep - 1) * 100:+.1f}% vs mine)')
     else:
