@@ -73,11 +73,12 @@ STREAMS = {
     'traffic': ('Sales & Traffic', 'daily', "Amazon's Sales & Traffic report for the last 30 days by ASIN (units ordered, Buy Box %, page views): the repricer's sales speed and Buy Box share."),
     'limits': ('Price limits from the Hub', 'hourly (pushed by the Hub)', 'Unit costs (InventoryLab, order ledger, lead cost), min/max overrides (liquidation, manual) and the limit settings, sent by the Hub.'),
     'retrain': ('Nightly model retraining', 'daily, 3:17 AM Central', 'Refits the Buy Box, rival-reaction and price-war models on the last 7 days of recorded data, in a separate process on this server, and swaps them in only if the new Buy Box model scores at least as well as the current one on the same held-out 2 days.'),
+    'abtest': ('Repricer vs Seller Snap test', 'daily switch, 3 AM Central', 'Alternating-day test: groups A and B swap between the repricer and Seller Snap each day, both on Seller Snap\'s min/max; decisions are tagged with their arm.'),
     'shadow': ('Repricer (shadow)', 'about 2 min after each offer change', 'Works out the price it would set for each listing and logs it; changes nothing.'),
     'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
 }
 LOCK = threading.Lock()
-import shadow as _shadow, live as _live, fees as _fees
+import shadow as _shadow, live as _live, fees as _fees, abtest as _abtest
 IN_STOCK = []  # ASINs with FBA stock, from the latest Seller Snap snapshot
 SELLABLE = []  # (sku, asin) with fulfillable quantity > 0, from the latest inventory snapshot
 
@@ -208,6 +209,8 @@ def sp_token():
 SH = _shadow.Shadow(DATA, append_gz, iso)
 LV = _live.Live(DATA, append_gz, iso, sp_token)
 SH.on_decision = LV.maybe_apply
+AB = _abtest.ABTest(DATA, append_gz, iso, live=LV)
+SH.ab = LV.ab = AB
 SH.tune_fn = lambda: LV.cfg
 FE = _fees.Fees(DATA, append_gz, iso, sp_token, on_fees=SH.on_fees)
 FEES_EVERY = int(os.environ.get('FEES_EVERY_S', '3600'))
@@ -719,6 +722,7 @@ def status():
         s['live'] = dict(LV.stats, env_live_mode=os.environ.get('LIVE_MODE', 'off'), config={k: (v if k != 'skus' else len(v)) for k, v in LV.cfg.items()})
     s['disk'] = {'used_gb': round(u.used / 2**30, 2), 'total_gb': round(u.total / 2**30, 2), 'free_frac': round(u.free / u.total, 3)}
     s['memory'] = {'free_mb': mem_headroom_mb(), 'retrain_needs_mb': RETRAIN_NEED_MB}
+    s['abtest'] = AB.public()
     return jsonify(s)
 
 
@@ -747,6 +751,40 @@ def model_get():
         return send_from_directory(os.path.dirname(SH.model_path()), 'model.json')
     except Exception:
         abort(404)
+
+
+@app.get('/abtest')
+def abtest_get():
+    need_key()
+    return jsonify(AB.public())
+
+
+@app.post('/abtest')
+def abtest_set():
+    """Test config: enabled, dry_run, start (YYYY-MM-DD), switch_hour, washout_h, groups {sku: A|B}, asins {sku: asin}, box_url, box_key."""
+    need_key()
+    try:
+        return jsonify(AB.set_cfg(request.get_json(force=True) or {}))
+    except (ValueError, TypeError) as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.post('/abtest/switch')
+def abtest_switch():
+    need_key()
+    return jsonify(AB.switch())
+
+
+@app.post('/abtest/end')
+def abtest_end():
+    need_key()
+    return jsonify(AB.end())
+
+
+@app.get('/abtest/groups')
+def abtest_groups():
+    need_key()
+    return jsonify({'groups': AB.cfg['groups'], 'asins': AB.cfg['asins']})
 
 
 @app.post('/retrain')
@@ -864,7 +902,10 @@ def components():
         st = json.loads(json.dumps(STATE))
     st['shadow'] = {'last': SH.stats.get('last_decision'), 'last_error': SH.stats.get('last_error')}
     st['live'] = {'last': LV.stats.get('last_applied'), 'last_error': LV.stats.get('last_error'),
-                  'state': 'on' if (LV.env_on() and LV.cfg.get('enabled') and LV.cfg.get('skus')) else 'off'}
+                  'state': 'on' if (LV.env_on() and LV.cfg.get('enabled') and (LV.cfg.get('skus') or (AB.running() and not AB.cfg['dry_run']))) else 'off'}
+    ls = AB.last_switch or {}
+    st['abtest'] = {'last': ls.get('t'), 'last_error': '; '.join(ls.get('errors') or []) or None,
+                    'state': ('dry run' if AB.cfg['dry_run'] else 'live') if AB.running() else ('scheduled' if AB.cfg.get('enabled') else 'off')}
     out = []
     for k, (name, when, what) in STREAMS.items():
         x = st.get(k) or {}
@@ -896,6 +937,7 @@ def start():
     STATE['started'] = iso()
     threading.Thread(target=SH.loop, daemon=True).start()
     threading.Thread(target=retrain_loop, daemon=True).start()
+    threading.Thread(target=AB.loop, daemon=True).start()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
     threading.Thread(target=segments_loop, daemon=True).start()

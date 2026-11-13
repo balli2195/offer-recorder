@@ -295,3 +295,22 @@ def test_rebuild_from_own_data_and_bb_raise(tmp_path):
     assert d['max'] == 39.0 and any('max raised' in r for r in d['reasons'])
     chk = sh.limits_check()
     assert chk['summary']['compared'] == 0          # no Seller Snap rows to compare with here
+
+
+def test_ab_test_skus_use_seller_snap_limits_and_are_tagged(tmp_path):
+    import abtest as AB, datetime as dt
+    written = []
+    sh = S.Shadow(str(tmp_path), lambda path, lines: written.append(lines), lambda: '2026-11-13T12:00:00Z')
+    sh.save_model(json.dumps(MODEL))
+    sh.on_listings([{'sku': 'S1', 'asin': 'A1', 'min_price': 26.5, 'max_price': 31.25, 'listed_price': 30, 'cost': 15, 'roi': 30, 'v30': 2, 'avg_bb_share': 50, 'repricing': True, 'qty': 5}])
+    ab = AB.ABTest(str(tmp_path), lambda p, l: None, lambda *a: 'x', wait=lambda s: None)
+    today = (dt.datetime.now(AB.CT) - dt.timedelta(hours=3)).date()
+    ab.set_cfg({'enabled': True, 'start': today.isoformat(), 'groups': {'S1': 'A'}})
+    sh.ab = ab
+    sh.on_message_bodies([body('A1', [(S.ME, 29.5, False), ('CALM', 30.4, True)])])
+    sh.offers['A1'] = (*sh.offers['A1'][:3], dict(sh.offers['A1'][3] if len(sh.offers['A1']) == 4 else {}, bb_price=45.0))
+    d = sh.decide_one('A1')
+    assert (d['min'], d['max']) == (26.5, 31.25)                       # Seller Snap's limits, and no raise to the rival's $45 Buy Box
+    assert sh.step() == 1
+    t = json.loads(written[-1][0])
+    assert t['arm'] == 'repricer' and t['ab_group'] == 'A' and t['ab_day'] == 0 and t['ab_dry_run'] is True

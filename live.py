@@ -2,6 +2,8 @@
   1. Render env LIVE_MODE=on                        (Nick sets this himself)
   2. live config enabled=true and the SKU is listed  (POST /live with the recorder key)
   3. Seller Snap isn't repricing that SKU            (while Nick still has Seller Snap; without it this check passes)
+  In the alternating-day test (abtest.py) a test SKU needs 1 and the live config enabled, and is priced only on its repricer days
+  (not in a dry run); it doesn't need to be in the live SKU list.
 Guardrails on every change: within the SKU's Seller Snap min/max, at most MAX_STEP_PCT per change (moves toward the target in steps),
 at least MIN_INTERVAL_S between changes per SKU, at most MAX_PER_DAY changes per SKU per day (Central-time day), never on a stale decision.
 Brakes on runs of price cuts (a loop with another repricer walks the price down; a bounce up and down costs little):
@@ -36,6 +38,7 @@ class Live:
         self.last_change = {}                # sku -> time of last applied change
         self.day_count = {}                  # (sku, date) -> changes applied
         self.ss_repricing = {}               # sku -> Seller Snap repricing flag
+        self.ab = None                       # abtest.ABTest, set by app.py
         self.seen = collections.defaultdict(collections.deque)   # sku -> (t, my price) over the last 24 h, live SKUs only
         self.cuts = {}                       # sku -> last applied cut {t, price, low_before, answered}
         self.streak = {}                     # sku -> answered cuts in a row
@@ -190,9 +193,14 @@ class Live:
         sku = d.get('sku')
         if not self.env_on():
             return None
-        if not self.cfg.get('enabled') or sku not in set(self.cfg['skus']):
+        ab = self.ab.live_allows(sku, now) if self.ab else None   # alternating-day test: None = not a test SKU
+        if not self.cfg.get('enabled'):
+            return None
+        if ab is None and sku not in set(self.cfg['skus']):
             return None
         self.observe(d, now)
+        if ab is False:   # a test SKU on Seller Snap's day (or the test is a dry run)
+            return None
         if d.get('action') == 'hold':
             return None
         with self.lock:

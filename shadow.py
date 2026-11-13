@@ -353,6 +353,7 @@ class Shadow:
         self.model = None
         self.on_decision = None
         self.tune_fn = None      # returns the tuning dict (live config), so settings live in one place
+        self.ab = None           # abtest.ABTest while the alternating-day test runs (set by app.py)
         self.recent = collections.deque(maxlen=2000)
         self.latest = {}         # asin -> latest decision
         self.stats = {'model_trained_at': None, 'decisions': 0, 'changes_suggested': 0, 'last_decision': None, 'last_error': None, 'by_action': {}}
@@ -789,6 +790,10 @@ class Shadow:
             if not o or not sku or not self.model:
                 return None
             sku = dict(sku, fees=(self.fees.get(sku['sku']) or {}).get('bands'), fixed_fee=self.fba_median)
+            ab = self.ab if (self.ab and self.ab.in_test(sku['sku'])) else None
+            if ab and ab.cfg.get('limits') == 'sellersnap' and sku.get('ss_min') and sku.get('ss_max'):
+                # alternating-day test: both repricers use Seller Snap's min/max (Nick, Nov 12)
+                sku.update(min=round(float(sku['ss_min']), 2), max=round(float(sku['ss_max']), 2))
             fo = self.foep.get(sku['sku'])
             crate = self.capital_rate
             st = self.stock.get(sku['sku'])
@@ -802,7 +807,8 @@ class Shadow:
             tune['decay_per_day'] = crate
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
                       suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'),
-                      me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0), bb_price=ex.get('bb_price'))
+                      me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0),
+                      bb_price=None if ab else ex.get('bb_price'))   # in the test, no raising the max to a rival's Buy Box (Seller Snap doesn't)
 
     def step(self):
         """Decide for ASINs that changed, at most once per DEBOUNCE_S each. Returns the number of decisions logged."""
@@ -821,6 +827,11 @@ class Shadow:
                 continue
             d['t'] = self.iso()
             d['ss_repricing'] = (self.listings.get(a) or {}).get('ss_repricing')
+            if self.ab:
+                arm = self.ab.arm(d['sku'], now)
+                if arm:
+                    d['arm'] = arm; d['ab_group'] = self.ab.cfg['groups'].get(d['sku']); d['ab_day'] = self.ab.day_index(now)
+                    d['washout'] = self.ab.washout(now); d['ab_dry_run'] = self.ab.cfg['dry_run']
             if self.on_decision:
                 try:
                     d['live'] = self.on_decision(d)
