@@ -598,6 +598,9 @@ def every(name, seconds, fn, needs):
 
 
 RETRAIN_AT = (3, 17)          # Central time
+# One math thread in the training child: OpenBLAS otherwise reserves a buffer per CPU it sees and, under the memory cap, failed with
+# "Memory allocation still failed" (the 3:17 AM run on Nov 13). The data is small; one thread is plenty.
+CHILD_ENV = {**os.environ, 'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
 RETRAIN_TIMEOUT = int(os.environ.get('RETRAIN_TIMEOUT_MIN', '180')) * 60   # the first run on Starter (0.5 CPU) needed over 75 min
 RETRAIN_NEED_MB = int(os.environ.get('RETRAIN_NEED_MB', '300'))   # a 7-day run peaked at 340 MB locally (Nov 12); the child is capped at the free memory, so a tight run fails on its own
 _retrain_lock = threading.Lock()
@@ -654,7 +657,7 @@ def retrain():
                 resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
         cmd = ['nice', '-n', '15', sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'train.py'),
                '--local', DATA, '--days', '7', '--out', cand, '--report', rep] + (['--current', cur] if os.path.exists(cur) else [])
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=RETRAIN_TIMEOUT, preexec_fn=limit)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=RETRAIN_TIMEOUT, preexec_fn=limit, env=CHILD_ENV)
         peak = round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024)
         tail = (r.stdout or '')[-3000:] + (r.stderr or '')[-2000:]
         if r.returncode != 0 or not os.path.exists(rep):
@@ -700,7 +703,7 @@ def refresh_rivals():
         os.makedirs(os.path.dirname(out), exist_ok=True)
         cmd = ['nice', '-n', '15', sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'train.py'),
                '--local', DATA, '--days', '7', '--rivals-only', out, '--out', os.path.join(DATA, 'model', 'unused.json')]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30 * 60)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30 * 60, env=CHILD_ENV)
         if r.returncode != 0:
             raise RuntimeError(f'exit {r.returncode}: {((r.stdout or "") + (r.stderr or ""))[-500:]}')
         SH.on_rivals()
