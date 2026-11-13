@@ -22,6 +22,7 @@ ME = S.ME; CAP = 1800
 U = os.environ.get('RECORDER_URL', 'https://offer-recorder.onrender.com'); H = {'X-Recorder-Key': os.environ.get('RECORDER_KEY', '')}
 ap = argparse.ArgumentParser(); ap.add_argument('--days', type=int, default=7); ap.add_argument('--upload', action='store_true'); ap.add_argument('--out', default='model.json'); ap.add_argument('--cache', default=None)
 ap.add_argument('--holder', action='store_true', help='also fit the holder models (bb_foep_h / bb_nofoep_h) for moments a rival holds the Buy Box')
+ap.add_argument('--stock-detail', action='store_true', help='test: keep each offer\'s live price and Keepa stock per Buy Box row (saved with bb_rows.pkl)')
 ap.add_argument('--local', default=None, help='read the recorder data folder directly instead of over HTTP')
 ap.add_argument('--current', default=None, help='current model.json to compare against (default: the recorder\'s, over HTTP)')
 ap.add_argument('--report', default=None, help='write the comparison and the keep/replace verdict here')
@@ -127,7 +128,7 @@ for pth in ([] if A.rivals_only else want('inventory')):
     for l in get(pth):
         x = json.loads(l); t = ts_(x['taken_at'])
         for r in x['rows']: inv[r['sellerSku']].append((t, (r.get('inventoryDetails') or {}).get('fulfillableQuantity') or 0))
-kp = collections.defaultdict(list)
+kp = collections.defaultdict(list); kps = collections.defaultdict(list)
 sh = S.Shadow.__new__(S.Shadow); sh.lock = __import__('threading').Lock(); sh.rival_stock = {}
 sh.fba_high = {}; sh.demand = {}; sh.save_state = lambda *a, **k: None; sh.rebuild = lambda: None
 for pth in ([] if A.rivals_only else want('keepa')):
@@ -135,8 +136,14 @@ for pth in ([] if A.rivals_only else want('keepa')):
         x = json.loads(l); t = ts_(x['taken_at']); sh.rival_stock = {}
         sh.on_keepa_products(x['response'].get('products'))
         for a, (_, v) in sh.rival_stock.items(): kp[a].append((t, v))
+        if A.stock_detail:   # per seller: FBA new-offer stock in this pull
+            for pr in x['response'].get('products') or []:
+                d = {o['sellerId']: (o.get('stockCSV') or [None])[-1] for o in pr.get('offers') or []
+                     if o.get('isFBA') and o.get('condition') == 1 and (o.get('stockCSV') or [])}
+                if d: kps[pr['asin']].append((t, d))
 for k in inv: inv[k].sort()
 for k in kp: kp[k].sort()
+for k in kps: kps[k].sort(key=lambda z: z[0])
 def lookup(series, t, max_age):
     if not series: return None
     i = bisect.bisect_right([s[0] for s in series], t) - 1
@@ -197,7 +204,10 @@ for a in ASINS:
         elif not w: hk, hp = 'other', None   # the winner isn't an available FBA offer: FBM or backordered
         else:
             hp = min(Pi[x] for x in w); hk = 'above' if hp > low + 0.005 else 'low'
-        R.append(dict(t=t, a=a, y=y, me=me, low=low, n=len(Pi) - 1, foep=f, share=share, hk=hk, hp=hp))
+        row = dict(t=t, a=a, y=y, me=me, low=low, n=len(Pi) - 1, foep=f, share=share, hk=hk, hp=hp)
+        if A.stock_detail:
+            row.update(mine=mine, riv=riv, po=dict(Pi), ks=lookup(kps.get(a), t, 8 * 3600))
+        R.append(row)
 DB.close()
 n = np.array([v[1] for v in react.values()]); k_ = np.array([v[0] for v in react.values()])
 m5 = n >= 5; pr = (k_[m5] / n[m5]) if m5.any() else np.array([0.3])
@@ -236,6 +246,8 @@ if A.rivals_only:
     __import__('shutil').rmtree(TMP, ignore_errors=True)
     sys.exit(0)
 D = pd.DataFrame(R); print('Buy Box rows', len(D), 'asins', D.a.nunique(), 'with stock share', int(D.share.notna().sum()), flush=True)
+if A.stock_detail:   # test runs: the rows, for offline comparisons
+    D.to_pickle(os.path.join(os.path.dirname(os.path.abspath(A.out)), 'bb_rows.pkl'))
 HOLD = bool(A.holder)
 def fx(r, wf, holder=False):
     x = S.feats(r.me, r.low, r.n, r.foep if wf else None, None if pd.isna(r.share) else r.share,
