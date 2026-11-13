@@ -21,7 +21,8 @@ class Http:
         self.calls.append(json); return R(302, loc='https://x/once')
     def get(self, url, timeout=None):
         b = self.calls[-1]
-        return R(200, {'ok': True, 'updated': len(b['skus']), 'failed': [s for s in b['skus'] if s in self.fail]})
+        f = [s for s in b['skus'] if s in self.fail]
+        return R(200, {'ok': True, 'result': {'on': b['on'], 'updated': len(b['skus']) - len(f), 'failed': f, 'skipped': []}})
 
 
 def mk(tmp_path, http=None, **cfg):
@@ -68,7 +69,7 @@ def test_switch_turns_seller_snap_off_then_on(tmp_path):
     r = ab.switch(ts(2026, 11, 13, 3, 0, 5))
     assert [(c['action'], c['skus'], c['on']) for c in http.calls] == [('set_repricing', ['S1'], False), ('set_repricing', ['S2'], True)]
     assert lv.ss_repricing == {'S1': False, 'S2': False}                  # S2's switch failed: left as it was
-    assert r['ok'] and r['repricer_group'] == 'A' and json.loads(logs[-1][0])['day'] == 0
+    assert not r['ok'] and r['errors'] == ['1 SKU(s) not switched: S2'] and r['repricer_group'] == 'A' and json.loads(logs[-1][0])['day'] == 0
     ab2 = AB.ABTest(str(tmp_path), lambda p, l: None, lambda *a: 'x', wait=lambda s: None)
     assert ab2.cfg['box_key'] == 'k' and ab2.last_switch['repricer_group'] == 'A'   # config kept on disk
     assert 'box_key' not in ab.public() and ab.public()['box_ready']

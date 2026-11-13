@@ -174,11 +174,14 @@ class ABTest:
                 for i in range(0, len(skus), 100):
                     chunk = skus[i:i + 100]
                     try:
-                        res = self.box('set_repricing', skus=chunk, on=flag)
-                        results.append({'on': flag, 'n': len(chunk), 'res': res})
-                        bad = set(res.get('failed') or []) if isinstance(res, dict) else set()
-                        if isinstance(res, dict) and res.get('error'):
-                            errors.append(str(res['error'])[:300]); bad = set(chunk)
+                        res = self.box('set_repricing', skus=chunk, on=flag)   # {ok, result: {updated, failed, skipped}} or {ok: false, error}
+                        r = (res.get('result') or {}) if isinstance(res, dict) else {}
+                        results.append({'on': flag, 'n': len(chunk), 'updated': r.get('updated'), 'failed': r.get('failed'), 'skipped': r.get('skipped')})
+                        bad = set(r.get('failed') or []) | set(r.get('skipped') or [])
+                        if not (isinstance(res, dict) and res.get('ok')):
+                            errors.append(str((res or {}).get('error') if isinstance(res, dict) else res)[:300]); bad = set(chunk)
+                        elif bad:
+                            errors.append(f"{len(bad)} SKU(s) not switched: {', '.join(sorted(bad)[:10])}")
                         if self.live:
                             with self.live.lock:
                                 for s in chunk:
@@ -202,8 +205,8 @@ class ABTest:
             for i in range(0, len(skus), 100):
                 try:
                     res = self.box('set_repricing', skus=skus[i:i + 100], on=True)
-                    if isinstance(res, dict) and res.get('error'):
-                        errors.append(str(res['error'])[:300])
+                    if not (isinstance(res, dict) and res.get('ok')):
+                        errors.append(str((res or {}).get('error') if isinstance(res, dict) else res)[:300])
                 except Exception as e:
                     errors.append(f'{type(e).__name__}: {str(e)[:200]}')
             rec.update(ok=not errors, errors=errors)
