@@ -264,3 +264,14 @@ def test_rival_refresh_overlays_newer_rival_tables(monkeypatch):
     assert A.STATE['rivals']['events'] == 123
     c.post('/model', data=json.dumps(dict(TS.MODEL, trained_at='2026-11-14T03:17:00+00:00')), headers=h)   # a newer nightly model wins
     assert 'NEW' not in A.SH.model['rivals']
+
+
+def test_repricer_history_endpoint():
+    import test_history as TH, gzip as gz
+    c = A.app.test_client(); h = {'X-Recorder-Key': 'k'}
+    A.HI.add([TH.body('HX1', TH.iso(600), [(A._shadow.ME, 20.0, 0, True, True, False), ('R9', 21.0, 0, True, False, False)])])
+    r = c.get('/repricer/history?asin=HX1&hours=24', headers=h)
+    d = json.loads(gz.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+    assert d['asin'] == 'HX1' and len(d['points']) == 1 and d['sellers'][A._shadow.ME]['me'] and d['arms'] == []
+    assert c.get('/repricer/history?asin=HX1').status_code == 401
+    assert c.get('/repricer/history', headers=h).status_code == 400

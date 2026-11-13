@@ -19,7 +19,7 @@ Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, QUEUE_URL, RECORDER_K
 import csv, datetime as dt, gzip, hmac, io, json, logging, os, resource, shutil, subprocess, sys, threading, time
 from zoneinfo import ZoneInfo
 import boto3, requests
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 DATA = os.environ.get('DATA_DIR', '/var/data')
 QUEUE = os.environ.get('QUEUE_URL', '')
@@ -56,6 +56,7 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'catalog': {'last': None, 'skus': None, 'by_status': None, 'last_error': None},
          'traffic': {'last': None, 'asins': None, 'last_error': None},
          'limits': {'last': None, 'costs': None, 'overrides': None, 'last_error': None},
+         'history': {'last': None, 'last_error': None},
          'rivals': {'last': None, 'seconds': None, 'events': None, 'last_error': None},
          'retrain': {'last': None, 'state': None, 'verdict': None, 'reasons': None, 'new_auc': None, 'current_auc': None, 'seconds': None,
                      'peak_mb': None, 'next': None, 'last_error': None}}
@@ -80,7 +81,7 @@ STREAMS = {
     'live': ('Repricer (live)', 'with each decision', 'Changes prices only for the live SKUs, with Render LIVE_MODE=on and Seller Snap repricing off; off by default.'),
 }
 LOCK = threading.Lock()
-import shadow as _shadow, live as _live, fees as _fees, abtest as _abtest
+import shadow as _shadow, live as _live, fees as _fees, abtest as _abtest, history as _history
 IN_STOCK = []  # ASINs with FBA stock, from the latest Seller Snap snapshot
 SELLABLE = []  # (sku, asin) with fulfillable quantity > 0, from the latest inventory snapshot
 
@@ -130,6 +131,8 @@ def save_batch(msgs):
     append_gz(os.path.join(DATA, 'offers', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
     if SH:
         _safe(SH.on_message_bodies, [m['Body'] for m in msgs])
+    if HI:
+        _safe(HI.add, [m['Body'] for m in msgs])
 
 
 def poll_once(sqs):
@@ -212,6 +215,11 @@ SH = _shadow.Shadow(DATA, append_gz, iso)
 LV = _live.Live(DATA, append_gz, iso, sp_token)
 SH.on_decision = LV.maybe_apply
 AB = _abtest.ABTest(DATA, append_gz, iso, live=LV)
+try:
+    HI = _history.History(DATA)
+except Exception:   # the chart index is a convenience; recording never depends on it
+    log.exception('history index')
+    HI = None
 SH.ab = LV.ab = AB
 SH.tune_fn = lambda: LV.cfg
 FE = _fees.Fees(DATA, append_gz, iso, sp_token, on_fees=SH.on_fees)
@@ -787,6 +795,43 @@ def model_get():
         abort(404)
 
 
+@app.get('/repricer/history')
+def repricer_history():
+    """Every new offer on one listing over the last `hours` (default 48, max 336), as change points, plus Nick's live price changes,
+    the SKU's min and max, and the A/B test arm by time, for the Hub's price chart."""
+    need_key()
+    asin = (request.args.get('asin') or '').strip().upper()
+    if not asin or not HI:
+        abort(400 if not asin else 503)
+    hours = max(1, min(336, int(request.args.get('hours', 48))))
+    out = HI.query(asin, hours, me=_shadow.ME)
+    out['live'] = [{k: r.get(k) for k in ('t', 'sku', 'from', 'to', 'action', 'response_status')}
+                   for r in LV.recent_log(hours // 24 + 2) if r.get('asin') == asin and ts_iso(r.get('t')) >= out['from']]
+    lst = (SH.listings.get(asin) if SH else None) or {}
+    sku = lst.get('sku')
+    test = sku in AB.cfg['groups']
+    out.update(sku=sku, title=lst.get('title'), min=lst.get('ss_min') if test else lst.get('min'), max=lst.get('ss_max') if test else lst.get('max'),
+               limits_from='Seller Snap (A/B test)' if test else 'repricer')
+    bands = []
+    if test and AB.cfg.get('enabled') and AB.cfg.get('start'):
+        t = out['from']
+        while t < out['to']:
+            nxt = min(AB.next_switch(t), out['to'])
+            arm = AB.arm(sku, t + 1)
+            if arm:
+                bands.append([round(t), round(nxt), arm])
+            t = nxt
+    out['arms'] = bands
+    return Response(gzip.compress(json.dumps(out, separators=(',', ':')).encode()), mimetype='application/json', headers={'Content-Encoding': 'gzip'})
+
+
+def ts_iso(s):
+    try:
+        return dt.datetime.fromisoformat(str(s).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return 0
+
+
 @app.get('/abtest')
 def abtest_get():
     need_key()
@@ -972,6 +1017,9 @@ def start():
     threading.Thread(target=SH.loop, daemon=True).start()
     threading.Thread(target=retrain_loop, daemon=True).start()
     threading.Thread(target=AB.loop, daemon=True).start()
+    if HI:
+        threading.Thread(target=delayed, args=(120, _safe, HI.backfill), daemon=True).start()
+        threading.Thread(target=delayed, args=(3600, every, 'history', 6 * 3600, HI.prune, []), daemon=True).start()
     threading.Thread(target=delayed, args=(1200, every, 'rivals', RIVALS_EVERY, refresh_rivals, []), daemon=True).start()
     STATE['pid'] = os.getpid()
     threading.Thread(target=offers_loop, daemon=True).start()
