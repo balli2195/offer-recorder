@@ -222,6 +222,11 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     if me <= low - 0.005:  # Nick alone at the low: the next offer minus a cent is a raise candidate
         cands |= {round(low - 0.01, 2)}
     cands = sorted({round(clip(c, lo, hi), 2) for c in cands})
+    # Never more than 1 cent under the lowest rival, Amazon's target included, unless the SKU is being liquidated (its min is a
+    # liquidation min, below the 12% ROI rule min). Nick, Nov 13: a 4% cut on a 50,000-a-month listing was more than needed.
+    liquidating = bool(sku.get('rule_min') and lo < sku['rule_min'] * 0.95)
+    if not liquidating:
+        cands = [c for c in cands if c >= low - 0.015 or abs(c - me) < 0.005] or [round(me, 2)]
     if me_backordered:   # Nick's units aren't available yet: don't compete on price (no cuts), as Seller Snap does; raises still allowed
         cands = [c for c in cands if c >= me - 0.005] or [round(me, 2)]
     lam = sku['lam']
@@ -230,7 +235,19 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     p_now = p_win(model, feats(me, low, n_riv, use_foep, share))
     qty = my_stock if my_stock is not None else (sku.get('qty') or 1)
     qty = max(qty, 1)
-    daily_now = lam * 24.0 * p_now
+    lst_h = sku.get('listing_h')
+
+    def units_per_h(p, pw):
+        # Own history (units per Buy Box hour) can badly undercount a new or just-restocked listing, so also use the listing's
+        # sales (Keepa "bought in past month", a floor) times Nick's sales share, which tracks his Buy Box share
+        # (Nov 12: share ~ 1.09 x Buy Box % + 1.7 pts). The 1.7 pts of sales without the Buy Box only while he's the
+        # cheapest or tied (fading out by 2% above the lowest rival), so a high price never looks like it sells on demand alone.
+        own = lam * pw
+        if not lst_h:
+            return own
+        extra = 0.017 * clip(1.0 - (p / low - 1.0) / 0.02, 0.0, 1.0) if low > 0 else 0.0
+        return max(own, lst_h * min(1.0, 1.09 * pw + extra))
+    daily_now = units_per_h(me, p_now) * 24.0
     days_to_sell = min(qty / max(daily_now, 0.05), 180.0)
     # What is already paid for is sunk: a unit sold now is worth its net proceeds; a unit kept is worth selling it later
     # near today's market low, less the cost of waiting (capital, storage, price erosion) over about half the sell-through time.
@@ -250,7 +267,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             pen = war_penalty_pct(model, rate) / 100.0 * low * (1 - ref_low) * exposed
         else:
             pw = pw_alone
-        units = min(lam * HORIZON_H * pw, qty)
+        units = min(units_per_h(p, pw) * HORIZON_H, qty)
         ev = units * ((p - f_p) - v_future) - pen
         rows.append({'price': p, 'p_win': round(pw, 4), 'units_24h': round(units, 3), 'fees': round(f_p, 2), 'margin': round(m, 2),
                      'roi': round(m / sku['cost'], 4) if sku['cost'] else None, 'profit_24h': round(units * m, 2),
@@ -282,6 +299,10 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         reasons.append(f'stock share {share:.0%}')
     if lo > low:
         reasons.append('floor above lowest rival')
+    if lst_h:
+        reasons.append(f'listing sells ~{lst_h * 24:,.0f}/day (Keepa)')
+    if liquidating:
+        reasons.append('liquidating: may go more than 1¢ under the lowest rival')
     if raised:
         reasons.append(f'max raised from {raised:.2f} to the Buy Box price {hi:.2f} held by a rival')
     if me_backordered:
@@ -295,6 +316,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': low, 'n_rivals': n_riv, 'winner': winner, 'suppressed': False,
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
+            'listing_per_day': round(lst_h * 24, 1) if lst_h else None, 'liquidating': liquidating,
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
             'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered}
 
@@ -354,6 +376,7 @@ class Shadow:
         self.fyp = {}               # sku -> (status, reason) from Amazon's suppressed-listings report
         self.limits = {}            # from the Hub (POST /limits): settings, costs, overrides
         self.fba_high = {}          # asin -> (highest lowest-FBA price in the past year, days of FBA history), from Keepa
+        self.listing_sold = {}      # asin -> [Keepa "bought in past month" for the whole listing, epoch seen]
         self.traffic = {}           # asin -> {units, bb, pv} over the last 30 days (Amazon Sales & Traffic)
         self.traffic_t = None
         self.load_state()
@@ -456,7 +479,7 @@ class Shadow:
         return os.path.join(self.data, 'limits', name)
 
     def load_state(self):
-        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic')):
+        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic'), ('listing_sold.json', 'listing_sold')):
             try:
                 with open(self.state_path(name)) as f:
                     v = json.load(f)
@@ -501,6 +524,7 @@ class Shadow:
         with self.lock:
             cat, inv, ss, lim = dict(self.catalog), dict(self.inv), dict(self.ss_rows), dict(self.limits)
             fees_by, fba_med, fh, tr = dict(self.fees), self.fba_median, dict(self.fba_high), dict(self.traffic)
+            lsold = dict(self.listing_sold)
         st = {**LIMIT_DEFAULTS, **(lim.get('settings') or {})}
         PREP = float(st['prep'])
         ov, costs = lim.get('overrides') or {}, lim.get('costs') or {}
@@ -527,6 +551,7 @@ class Shadow:
             cost, csrc = L.resolve_cost(sku, asin, costs, r.get('cost'))
             bands = (fees_by.get(sku) or {}).get('bands')
             o = ov.get(sku) or {}
+            rule_mn = L.rule_min(cost, bands, PREP, st['min_roi'], fba_med) if cost else None
             if o.get('min') is not None:
                 mn, nsrc = float(o['min']), (o.get('source') or 'override') + ' min'
             elif cost:
@@ -556,6 +581,8 @@ class Shadow:
                 src[f'{k}: {v}'] += 1
             out[asin] = {'sku': sku, 'title': (c.get('title') or r.get('title') or '')[:120], 'min': round(mn, 2), 'max': round(mx, 2), 'cost': round(cost, 4),
                          'listed': c.get('price') or r.get('listed_price'), 'v30': round(v30, 4), 'lam': max(v30, 0.01) / 24.0 / bbs,
+                         'listing_h': (lsold[asin][0] / 720.0) if asin in lsold and time.time() - lsold[asin][1] < 14 * 86400 else None,
+                         'rule_min': round(rule_mn, 2) if rule_mn else None,
                          'qty': iv.get('fulfillable', r.get('qty')), 'ss_repricing': bool(r.get('repricing')) if r else False,
                          'src': {'cost': csrc, 'min': nsrc, 'max': xsrc, 'sales': dsrc},
                          'ss_min': r.get('min_price'), 'ss_max': r.get('max_price'), 'ss_cost': r.get('cost'),
@@ -785,6 +812,12 @@ class Shadow:
             self.foep[sku] = (time.time(), v)
 
     def on_keepa_products(self, products):
+        sold = {p['asin']: [p['monthlySold'], time.time()] for p in products or [] if (p.get('monthlySold') or 0) > 0}
+        if sold:
+            with self.lock:
+                self.listing_sold.update(sold)
+                ls = dict(self.listing_sold)
+            self.save_state('listing_sold.json', ls)
         highs = {}
         for p in products or []:
             cs = p.get('csv') or []

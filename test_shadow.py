@@ -323,3 +323,25 @@ def test_rival_rate_uses_the_listing_record_pulled_toward_the_seller():
     r, lag, own = S.rival_info(m, 'R', 'A1'); assert own and abs(r - 0.125) < 1e-9 and lag == 10.0     # ignores undercuts on A1
     r, lag, own = S.rival_info(m, 'R', 'A2'); assert abs(r - 0.75) < 1e-9 and abs(lag - 7.0) < 1e-9    # fights on A2, and fast
     assert S.rival_info(m, 'R', 'A9')[0] == 0.5 and S.rival_info(m, 'X', 'A1')[0] == 0.2
+
+
+def test_never_more_than_a_cent_under_the_lowest_rival_unless_liquidating():
+    # tied at $27 with several rivals, Amazon's target at $25.91 (the B0FKGJYFC8 case, Nov 13), lots of slow stock
+    sku = dict(SKU, min=25.56, max=28.07, cost=14.48, lam=0.005, rule_min=25.57)
+    offs = {S.ME: 27.0, 'R1': 27.0, 'R2': 27.0, 'R3': 27.0}
+    d = S.decide(MODEL, 'A1', offs, 'R1', sku, foep=25.91, foep_age=60, my_stock=600)
+    assert d['rec_price'] >= 26.99 and not d['liquidating']
+    liq = S.decide(MODEL, 'A1', offs, 'R1', dict(sku, min=22.0), foep=25.91, foep_age=60, my_stock=600)   # liquidation min
+    assert liq['liquidating'] and liq['best']['price'] < 26.99          # the target below the rivals is allowed again
+
+
+def test_listing_demand_makes_deep_cuts_unattractive():
+    sku = dict(SKU, min=20.0, max=40.0, cost=14.48, lam=0.005, rule_min=20.0)
+    offs = {S.ME: 27.5, 'R1': 27.0, 'R2': 27.0}
+    slow = S.decide(MODEL, 'A1', offs, 'R1', sku, my_stock=300)
+    busy = S.decide(MODEL, 'A1', offs, 'R1', dict(sku, listing_h=50000 / 720.0), my_stock=300)
+    assert busy['days_to_sell'] < slow['days_to_sell'] and busy['listing_per_day'] == 1666.7
+    assert busy['cur']['units_24h'] > slow['cur']['units_24h']
+    # a high price doesn't look like it sells on listing demand alone (no sales-without-Buy-Box credit far above the low)
+    hi = S.decide(MODEL, 'A1', {S.ME: 39.0, 'R1': 27.0, 'R2': 27.0}, 'R1', dict(sku, listing_h=50000 / 720.0), my_stock=5)
+    assert hi['rec_price'] < 39.0
