@@ -125,8 +125,10 @@ def fba_offers(n):
     for o in n.get('Offers') or []:
         if o.get('SubCondition') != 'new':
             continue
-        if o.get('IsBuyBoxWinner'):
-            win = o['SellerId']          # any fulfillment: a merchant-fulfilled offer can hold the Buy Box too
+        if o.get('IsBuyBoxWinner') and win != ME:
+            # any fulfillment (a merchant-fulfilled offer can hold the Buy Box too). Amazon often flags 2-3 winners at once (Nov 13):
+            # Nick counts as the holder whenever he is flagged; otherwise the first flagged rival
+            win = o['SellerId'] if (o['SellerId'] == ME or win is None) else win
         if not o.get('IsFulfilledByAmazon'):
             continue
         bo = backordered(o)
