@@ -107,19 +107,37 @@ def test_inventory_walks_pages_keeps_rows_with_qty(monkeypatch):
     assert [x['sellerSku'] for x in snap['rows']] == ['S1', 'S3', 'S4'] and snap['skus_seen'] == 4
     assert A.SELLABLE == [('S1', 'A1'), ('S4', 'A4')] and A.STATE['inventory']['sellable_skus'] == 2
 
-def test_foep_sweep_batches_of_40_with_backoff(monkeypatch):
+def test_foep_scheduler_changed_listings_first_then_sweep():
+    sch = A.FoepScheduler(600)
+    sell = [f'S{i:03d}' for i in range(85)]
+    want = ['S080', 'X9']                                   # X9 isn't sellable: dropped
+    take = lambda n, allowed: [k for k in want if k in allowed][:n]
+    b, ev = sch.batch(1000.0, sell, take)
+    assert b[:1] == ['S080'] and ev == 1 and len(b) == 40 and not sch.done
+    want.clear()
+    b, _ = sch.batch(1031.0, sell, take); assert len(b) == 40
+    b, _ = sch.batch(1062.0, sell, take); assert len(b) == 5 and sch.done and 'S080' not in b   # 85 - 40 - 40; S080 (read first) not read twice
+    b, _ = sch.batch(1093.0, sell, take); assert b == []       # next sweep at 1000 + 600
+    want.append('S005')
+    b, ev = sch.batch(1124.0, sell, take); assert b == ['S005'] and ev == 1   # a changed listing is read between sweeps
+    b, _ = sch.batch(1600.0, sell, None); assert len(b) == 40   # new sweep
+    sch.put_back(['S000']); assert sch.todo[0] == 'S000'
+
+
+def test_foep_loop_one_call_with_backoff(monkeypatch):
     A.SELLABLE = [(f'S{i:03d}', f'A{i:03d}') for i in range(85)]
     calls = []; waits = []
     def post(url, headers, json, timeout):
         assert url.endswith('/offer/featuredOfferExpectedPrice')
         calls.append(len(json['requests']))
-        if len(calls) == 2: return G(429)
+        if len(calls) == 1: return G(429)
         return G(200, {'responses': [{'status': {'statusCode': 200}, 'body': {'featuredOfferExpectedPriceResults': []}} for _ in json['requests']]})
     monkeypatch.setattr(A.requests, 'post', post); monkeypatch.setattr(A, 'sp_token', lambda: 't')
     before = A.STATE['foep']['saved']
-    assert A.foep_sweep(wait=waits.append) is True
-    assert calls == [40, 40, 40, 5] and A.STATE['foep']['saved'] - before == 85 and A.STATE['foep']['throttled'] >= 1
-    assert waits.count(A.FOEP_GAP) == 3 and A.STATE['foep']['skus'] == 85
+    skus, ev = A.foep_loop(wait=waits.append, once=True)
+    assert calls == [40, 40] and len(skus) == 40 and A.STATE['foep']['saved'] - before == 40 and A.STATE['foep']['throttled'] >= 1
+    assert waits and waits[0] == A.FOEP_GAP * 2   # backed off after the 429
+
 
 def test_run_report_and_health(monkeypatch):
     perf = json.dumps({'accountStatuses': [{'marketplaceId': 'ATVPDKIKX0DER', 'status': 'AT_RISK'}]}).encode()

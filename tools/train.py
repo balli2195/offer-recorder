@@ -122,6 +122,14 @@ for pth in ([] if A.rivals_only else want('foep')):
         a = (b.get('offerIdentifier') or {}).get('asin')
         if r.get('resultStatus') == 'VALID_FOEP' and a:
             fo[a].append((ts_(x['taken_at']), x['sku'], a, r['featuredOfferExpectedPrice']['listingPrice']['amount']))
+# one training moment per SKU per 25 min at most: readings got more frequent on Nov 13 (10-min sweeps + changed listings),
+# and the Buy Box label covers 30 min, so closer readings would mostly repeat the same moment
+for a_ in fo:
+    fo[a_].sort(); kept, last = [], {}
+    for x in fo[a_]:
+        if x[0] - last.get(x[1], -1e18) >= 1500:
+            kept.append(x); last[x[1]] = x[0]
+    fo[a_] = kept
 inv = collections.defaultdict(list)
 for pth in ([] if A.rivals_only else want('inventory')):
     for l in get(pth):

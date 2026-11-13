@@ -6,7 +6,8 @@ Four loops write gzip JSONL to the Render disk:
             which Amazon suppresses the Buy Box, WasPrice) for every in-stock ASIN, one call per 31 s, about 15 min a sweep
   orders/   Amazon all-orders report, last 8 days, pulled every 30 min (one file per day, replaced each pull), customer location columns removed
   inventory/ Amazon FBA inventory summaries (fulfillable, reserved, inbound, unfulfillable), hourly, every SKU with any quantity
-  foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU, a sweep every 30 min
+  foep/     Amazon's featured offer expected price (the Buy Box target price) for every sellable SKU: a sweep every 10 min, plus listings
+            that change while their target is over 5 min old, read in the next call
   health/   daily seller performance report (account status, metrics) and suppressed-listings report
   keepa/    Keepa live offers with stock for in-stock ASINs, every 6 h, full responses (needs KEEPA_KEY)
   traffic/  Amazon's Sales & Traffic report, last 30 days by child ASIN, daily, full JSON
@@ -30,7 +31,7 @@ SEG_GAP = float(os.environ.get('SEG_GAP_S', '31'))  # Amazon's limit for this ca
 SNAP_EVERY = int(os.environ.get('SNAP_EVERY_S', '3600'))
 ORDER_EVERY = int(os.environ.get('ORDER_EVERY_S', '1800'))   # every 30 min: the repricer's 'a sale since the last cut?' check and its sales pace (Nick, Nov 13)
 INV_EVERY = int(os.environ.get('INV_EVERY_S', '3600'))
-FOEP_EVERY = int(os.environ.get('FOEP_EVERY_S', '1800'))
+FOEP_EVERY = int(os.environ.get('FOEP_EVERY_S', '600'))   # a full sweep every 10 min (Nov 13; was 30); changed listings are read in between
 FOEP_GAP = float(os.environ.get('FOEP_GAP_S', '31'))  # Amazon's limit for the FOEP batch call is 0.033 requests/second, 40 SKUs a call
 HEALTH_EVERY = int(os.environ.get('HEALTH_EVERY_S', '86400'))
 KEEPA_EVERY = int(os.environ.get('KEEPA_EVERY_S', '21600'))
@@ -49,7 +50,7 @@ STATE = {'started': None, 'offers': {'saved': 0, 'last_saved': None, 'last_sent'
          'segments': {'sweeps': 0, 'last_sweep': None, 'asins': None, 'saved': 0, 'throttled': 0, 'last_saved': None, 'last_error': None},
          'listings': {'last': None, 'rows': None, 'last_error': None}, 'orders': {'last': None, 'rows': None, 'last_error': None},
          'inventory': {'last': None, 'skus': None, 'sellable_skus': None, 'last_error': None},
-         'foep': {'sweeps': 0, 'last_sweep': None, 'skus': None, 'saved': 0, 'throttled': 0, 'last_error': None},
+         'foep': {'sweeps': 0, 'last_sweep': None, 'skus': None, 'saved': 0, 'throttled': 0, 'event_reads': 0, 'queue': 0, 'last_error': None},
          'health': {'last': None, 'account_status': None, 'suppressed_rows': None, 'last_error': None},
          'keepa': {'last': None, 'asins': None, 'tokens_used': None, 'tokens_left': None, 'last_error': None},
          'fees': {'last': None, 'skus': None, 'refreshed': None, 'sellable': None, 'last_error': None},
@@ -67,7 +68,7 @@ STREAMS = {
     'listings': ('Seller Snap snapshot', 'hourly', 'Min, max, price, cost, ROI, sales speed and Buy Box share for every SKU, read through the Seller Snap box.'),
     'orders': ('Orders', 'daily', 'Last 8 days of the all-orders report, customer location removed.'),
     'inventory': ('FBA inventory', 'hourly', 'Fulfillable, reserved, inbound and unfulfillable units for every SKU with stock.'),
-    'foep': ('Buy Box target price', 'every 30 min', "Amazon's featured offer expected price (the Buy Box target) for every sellable SKU."),
+    'foep': ('Buy Box target price', 'every 10 min + changed listings', "Amazon's featured offer expected price (the Buy Box target) for every sellable SKU."),
     'health': ('Account health', 'daily', 'Seller performance report and suppressed listings.'),
     'keepa': ('Keepa rival stock and year of prices', 'every 6 h; a year of history weekly', 'Live offers with stock for in-stock ASINs, full Keepa responses. Once a week (and for a new in-stock ASIN, at its next pull) a year of price history, for the max price rule.'),
     'fees': ('Amazon fees', 'daily per SKU, hourly for new SKUs', "Amazon's own fee estimate for every sellable SKU at a price under $10, $10-$50 and over $50, used by the repricer."),
@@ -448,45 +449,67 @@ def foep_batch(skus, token):
     return True
 
 
-def foep_sweep(wait=time.sleep):
-    with LOCK:
-        skus = [s for s, a in SELLABLE]
-    if not skus:
-        return False
-    token, t0 = sp_token(), time.time()
-    for i in range(0, len(skus), 40):
-        if time.time() - t0 > 2700:  # refresh the 1-hour token
-            token, t0 = sp_token(), time.time()
-        tries = 0
-        while True:
-            if free_frac() < MIN_FREE:
-                return False
-            if foep_batch(skus[i:i + 40], token):
-                wait(FOEP_GAP)
-                break
-            tries += 1
-            wait(min(300, FOEP_GAP * 2 ** tries))
-            if tries >= 5:
-                break
-    with LOCK:
-        STATE['foep'].update(sweeps=STATE['foep']['sweeps'] + 1, last_sweep=iso(), skus=len(skus), last_error=None)
-    return True
+class FoepScheduler:
+    """Which SKUs go in the next target-price call (40 at most, one call per FOEP_GAP): listings that just changed with a stale
+    target first (shadow.take_foep_wanted), then the running sweep of every sellable SKU, a new sweep starting every FOEP_EVERY."""
+    def __init__(self, every):
+        self.every, self.todo, self.next_sweep, self.done = every, [], 0.0, False
+
+    def batch(self, now, sellable, take_wanted):
+        self.done = False
+        if not self.todo and now >= self.next_sweep:
+            self.todo, self.next_sweep = list(sellable), now + self.every
+        ev = take_wanted(40, set(sellable)) if take_wanted else []
+        rest = [x for x in self.todo if x not in ev][:40 - len(ev)]
+        if rest or ev:
+            taken = set(rest) | set(ev)
+            had = bool(self.todo)
+            self.todo = [x for x in self.todo if x not in taken]
+            self.done = had and not self.todo
+        return ev + rest, len(ev)
+
+    def put_back(self, skus):
+        self.todo = list(skus) + [x for x in self.todo if x not in set(skus)]
 
 
-def foep_loop():
+def foep_loop(wait=time.sleep, once=False):
+    sch = FoepScheduler(FOEP_EVERY)
+    token, t0, tries = None, 0.0, 0
     while True:
-        t0 = time.time()
         try:
-            if not foep_sweep():
-                time.sleep(60)
-                continue
+            if free_frac() < MIN_FREE:
+                wait(60); continue
+            with LOCK:
+                sell = [s for s, a in SELLABLE]
+            if not sell:
+                wait(30); continue
+            if token is None or time.time() - t0 > 2700:  # refresh the 1-hour token
+                token, t0 = sp_token(), time.time()
+            skus, n_ev = sch.batch(time.time(), sell, SH.take_foep_wanted if SH else None)
+            with LOCK:
+                STATE['foep']['queue'] = len(SH.foep_wanted) if SH else 0
+            if not skus:
+                wait(5); continue
+            if not foep_batch(skus, token):
+                sch.put_back(skus)
+                tries += 1
+                wait(min(300, FOEP_GAP * 2 ** tries)); continue
+            tries = 0
+            if SH:
+                _safe(SH.save_foep)
+            with LOCK:
+                STATE['foep']['event_reads'] += n_ev
+                if sch.done:
+                    STATE['foep'].update(sweeps=STATE['foep']['sweeps'] + 1, last_sweep=iso(), skus=len(sell), last_error=None)
+            if once:
+                return skus, n_ev
+            wait(FOEP_GAP)
         except Exception as e:
             log.exception('foep')
             with LOCK:
                 STATE['foep']['last_error'] = f'{iso()} {type(e).__name__}: {str(e)[:200]}'
-            time.sleep(120)
-            continue
-        time.sleep(max(0, FOEP_EVERY - (time.time() - t0)))
+            token = None
+            wait(120)
 
 
 def snapshot_health():

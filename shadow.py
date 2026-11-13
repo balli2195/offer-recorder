@@ -18,6 +18,7 @@ import limits as L
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
 FOEP_MAX_AGE = 45 * 60
+FOEP_REFRESH_S = 300       # a listing that changes with a target older than this gets its target read first in the next call (Nov 13)
 MIN_GAIN_ABS = 0.50      # $/day of expected profit before a change is recommended
 MIN_GAIN_REL = 0.05      # or 5 %
 DEBOUNCE_S = 120         # at most one decision per ASIN every 2 minutes
@@ -374,7 +375,8 @@ class Shadow:
         self.offers = {}            # asin -> (t, {seller: price}, winner)
         self.listings = {}          # asin -> sku dict
         self.stock = {}             # sku -> fulfillable
-        self.foep = {}              # sku -> (t, value)
+        self.foep = {}              # sku -> (t, value); saved to limits/foep.json so a restart keeps it (with the time it was read)
+        self.foep_wanted = collections.OrderedDict()   # sku -> time its listing changed while its target was stale
         self.rival_stock = {}       # asin -> (t, units of competitive rivals)
         self.fees = {}              # sku -> {'t', 'bands'} from Amazon's fee estimates
         self.fba_median = FALLBACK_FBA
@@ -481,6 +483,10 @@ class Shadow:
                 if ME in offs:
                     self.pending[a] = True
                     self.pending.move_to_end(a)
+                    sku = (self.listings.get(a) or {}).get('sku')
+                    fo = self.foep.get(sku) if sku else None
+                    if sku and (not fo or time.time() - fo[0] > FOEP_REFRESH_S):
+                        self.foep_wanted.setdefault(sku, time.time())
 
     def on_listings(self, rows):
         """Seller Snap snapshot: kept only as a fallback (cost, min, sales) while the SKU has no data of Nick's own, and for its on/off flag."""
@@ -494,11 +500,12 @@ class Shadow:
         return os.path.join(self.data, 'limits', name)
 
     def load_state(self):
-        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic'), ('demand.json', 'demand')):
+        for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic'), ('demand.json', 'demand'),
+                           ('foep.json', 'foep')):
             try:
                 with open(self.state_path(name)) as f:
                     v = json.load(f)
-                if attr == 'fba_high':
+                if attr in ('fba_high', 'foep'):
                     v = {k: tuple(x) for k, x in v.items()}
                 setattr(self, attr, v)
             except (FileNotFoundError, ValueError, OSError):
@@ -870,6 +877,24 @@ class Shadow:
             return
         with self.lock:
             self.foep[sku] = (time.time(), v)
+            self.foep_wanted.pop(sku, None)
+
+    def save_foep(self):
+        with self.lock:
+            d = {k: list(v) for k, v in self.foep.items()}
+        self.save_state('foep.json', d)
+
+    def take_foep_wanted(self, n, allowed):
+        """Up to n SKUs whose listing changed while their target was stale, oldest first (only SKUs in `allowed`, the sellable ones)."""
+        out = []
+        with self.lock:
+            for k in list(self.foep_wanted):
+                if len(out) >= n:
+                    break
+                del self.foep_wanted[k]
+                if k in allowed:
+                    out.append(k)
+        return out
 
     def on_keepa_products(self, products):
         dm = {}

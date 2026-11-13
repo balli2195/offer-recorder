@@ -337,3 +337,16 @@ def test_holder_model_used_only_when_a_rival_holds():
     assert mine['cur']['p_win'] == S.decide(MODEL, 'A1', offs, S.ME, SKU)['cur']['p_win']
     x = S.feats(30.0, 30.0, 2, holder={'kind': 'above', 'price': 31.0})
     assert x['h_above'] == 1.0 and x['h_gap_neg'] < 0 and S.p_win(hm, x) != S.p_win(hm, S.feats(30.0, 30.0, 2))
+
+
+def test_targets_survive_restart_and_changed_listings_are_queued(tmp_path):
+    sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda *a: 'now')
+    sh.listings = {'A1': {'sku': 'S1'}, 'A2': {'sku': 'S2'}}
+    sh.on_foep('S1', {'featuredOfferExpectedPriceResults': [{'resultStatus': 'VALID_FOEP', 'featuredOfferExpectedPrice': {'listingPrice': {'amount': 29.9}}}]})
+    sh.save_foep()
+    t0 = sh.foep['S1'][0]
+    sh2 = S.Shadow(str(tmp_path), lambda p, l: None, lambda *a: 'now')
+    assert sh2.foep['S1'] == (t0, 29.9)                                      # reloaded with the time it was read
+    sh.on_message_bodies([body('A1', [(S.ME, 30.0, True), ('R', 31.0, False)]), body('A2', [(S.ME, 30.0, True), ('R', 31.0, False)])])
+    assert list(sh.foep_wanted) == ['S2']                                    # S1's target is fresh; S2 has none
+    assert sh.take_foep_wanted(40, {'S2'}) == ['S2'] and not sh.foep_wanted
