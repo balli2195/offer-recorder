@@ -629,7 +629,7 @@ if c_:
 check['verdict'] = 'keep current' if check['reasons'] else 'replace'
 check['current_trained_at'] = (cur or {}).get('trained_at')
 check['holder_models'] = holder_ok
-check['v2'] = {k: {kk: v[kk] for kk in ('kept', 'mse_new', 'mse_old', 'test_rows')} for k, v in V2_REPORT.items()}
+check['v2'] = {k: {kk: v.get(kk) for kk in ('kept', 'mse_new', 'mse_old', 'test_rows', 'mse_hold_new', 'mse_hold_current', 'mse_change_new', 'mse_change_current', 'error')} for k, v in V2_REPORT.items()}
 model['check'] = check
 print('safety check', json.dumps(check), flush=True)
 raw = json.dumps(model); open(A.out, 'w').write(raw); print('wrote', A.out, len(raw), 'bytes')
