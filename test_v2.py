@@ -61,3 +61,21 @@ def test_shadow_loads_boosters_from_model(tmp_path):
     os.makedirs(tmp_path / 'model'); json.dump(m, open(tmp_path / 'model' / 'model.json', 'w'))
     sh = S.Shadow(str(tmp_path), lambda p, l: None, lambda *a: 'now')
     assert list(sh.boosters) == ['tree_foep'] and 'tree_foep' in sh.stats['model_parts']
+
+
+def test_decide_uses_unified_model_when_a_target_is_known():
+    # Nick, Nov 14: one model scores the current price (is_change 0) and every other price (is_change 1); no-target decisions don't use it
+    offs = {S.ME: 30.5, 'CALM': 30.0}
+    uni = dict(MODEL, bb_unified={'coef': {'b': 0.0, 'is_change': -5.0}, 'platt': {'hold': [1.0, 0.0], 'change': [1.0, 0.0]}})
+    ctx = lambda n, hk: [0.0] * len(CX.FEATURES)
+    d = S.decide(uni, 'A1', offs, 'CALM', SKU, foep=30.2, foep_age=60, boosters={'tree_unified': Tree(0.5)}, ctx_fn=ctx)
+    assert d['bb_parts'] == ['unified model', 'unified tree', 'calibrated']
+    assert abs(d['cur']['p_win'] - S.sigmoid(0.5)) < 1e-3                      # holding: b + tree
+    assert d['best']['price'] == 30.5 or d['best']['p_win'] < 0.02             # other prices: is_change -5 + tree 0.5
+    x = S.unified_feats(30.0, 30.5, 30.0, 1, 30.2, {'kind': 'low', 'price': 30.0})
+    assert x['is_change'] == 1.0 and x['chg_x_t_ok'] == x['t_ok'] and x['share'] == 0.0 and 'chg_x_is_change' not in x
+    h = S.unified_feats(30.5, 30.5, 30.0, 1, 30.2, {'kind': 'me'})
+    assert h['is_change'] == 0.0 and h['c_step'] == 0.0 and all(v == 0.0 for k, v in h.items() if k.startswith('chg_x_'))
+    nt = S.decide(uni, 'A1', offs, 'CALM', SKU)                                # no target: the old no-target path
+    assert 'unified model' not in nt['bb_parts']
+    assert abs(S.platt(0.7, [0.9, -0.12]) - S.sigmoid(0.9 * math.log(0.7 / 0.3) - 0.12)) < 1e-9

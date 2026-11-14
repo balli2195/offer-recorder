@@ -6,10 +6,13 @@
   (not in a dry run); it doesn't need to be in the live SKU list.
 Guardrails on every change: within the SKU's Seller Snap min/max, at most MAX_STEP_PCT per change (moves toward the target in steps),
 at least MIN_INTERVAL_S between changes per SKU, at most MAX_PER_DAY changes per SKU per day (Central-time day), never on a stale decision.
-Brakes on runs of price cuts (a loop with another repricer walks the price down; a bounce up and down costs little):
-  chased     a cut counts as answered when a rival moves to or below the new price within CHASE_WINDOW_MIN; after CHASE_CUTS answered cuts
-             in a row, cuts on that SKU stop for FREEZE_H hours (raises and holds still allowed) and the SKU is listed as paused
-  drop limit a cut never takes the price more than MAX_DROP_PCT below its highest point in the last 24 h
+Brakes OFF by default (Nick, Nov 14: the model decides cuts and steps itself; the brakes trimmed 83% of its cuts on Nov 14).
+With brakes=true in the live config the old rules return: the MAX_STEP_PCT step cap, 5-cent cuts below the lowest rival with a
+30-min wait and no Buy Box / sale in that time, no catch-up cut after holding the Buy Box, and the chase pause (CHASE_CUTS answered
+cuts in a row within CHASE_WINDOW_MIN stop cuts for FREEZE_H hours).
+Always on (bug and bad-data rails, not strategy): min/max, waiting for Amazon to show the last change, MIN_INTERVAL_S between changes,
+MAX_PER_DAY changes per SKU, and the drop limit: a cut never takes the price more than MAX_DROP_PCT (25%) below its highest point in
+the last 24 h, so a junk rival price can't drag it to the min in one go.
 Prices are written with the Listings Items API (patchListingsItem, purchasable_offer.our_price), keeping the offer's other fields.
 Every attempt is logged to live/<date>.jsonl.gz. POST /live/stop turns it off immediately."""
 import collections, copy, datetime as dt, gzip, json, math, os, threading, time
@@ -22,7 +25,7 @@ ME = 'A2UYRB3AYUMGAJ'
 CT = ZoneInfo('America/Chicago')
 SHOW_WAIT_S = 20 * 60   # longest wait for an accepted change to show up in Amazon's offers before deciding again
 DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s': 600, 'max_per_day': 96,
-            'chase_window_min': 30, 'chase_cuts': 2, 'freeze_h': 6.0, 'max_drop_pct': 10.0,
+            'chase_window_min': 30, 'chase_cuts': 2, 'freeze_h': 6.0, 'max_drop_pct': 25.0, 'brakes': False,
             # inching down (Nick, Nov 13): each cut at most max_cut_abs dollars, then wait cut_wait_min and cut again only if, in that
             # window, Nick neither held the Buy Box nor sold a unit. Raises are not limited by this.
             'max_cut_abs': 0.05, 'cut_wait_min': 30, 'catch_up': True,
@@ -89,6 +92,7 @@ class Live:
         c['max_cut_abs'] = round(float(min(max(c['max_cut_abs'], 0.01), 5.0)), 2)
         c['cut_wait_min'] = int(min(max(c['cut_wait_min'], 5), 240))
         c['catch_up'] = bool(c.get('catch_up', True))
+        c['brakes'] = bool(c.get('brakes', False))
         c['decay_auto'] = bool(c['decay_auto'])
         c['decay_per_day'] = float(min(max(c['decay_per_day'], 0.0), 0.02))
         c['min_gain_abs'] = float(min(max(c['min_gain_abs'], 0.0), 50.0))
@@ -229,10 +233,14 @@ class Live:
         me, rec, lo, hi = d['my_price'], d['rec_price'], d['min'], d['max']
         if not (lo and hi and lo <= rec <= hi):
             return self._block('outside min/max')
-        step = self.cfg['max_step_pct'] / 100.0
-        new = round(min(max(rec, me * (1 - step)), me * (1 + step)), 2)
+        brakes = bool(self.cfg.get('brakes', False))
+        if brakes:
+            step = self.cfg['max_step_pct'] / 100.0
+            new = round(min(max(rec, me * (1 - step)), me * (1 + step)), 2)
+        else:
+            new = round(rec, 2)
         new = round(min(max(new, lo), hi), 2)
-        if new < me - 0.005:
+        if new < me - 0.005 and brakes:
             self._frozen_stats()
             if sku in self.frozen:
                 return self._block('cuts paused: chased by a rival')
@@ -255,6 +263,7 @@ class Live:
                     if held or sold:
                         return self._block(f"Buy Box or a sale in the last {self.cfg['cut_wait_min']} min: no cut")
                 new = max(new, round(me - self.cfg['max_cut_abs'], 2))
+        if new < me - 0.005:
             high = max([p for _, p in self.seen[sku]] + [me])
             floor = math.ceil(high * (1 - self.cfg['max_drop_pct'] / 100.0) * 100 - 1e-6) / 100.0
             if new < floor:
