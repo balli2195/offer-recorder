@@ -91,3 +91,24 @@ def test_saleslink_fit_recovers_beta():
         seg[a] = (tt, ss); sales[a] = sl
     r = SL.fit(seg, sales, t0, 56 * b, test_from=40 * b)
     assert abs(r['beta'] - 0.25) <= 0.06 and r['test_dev'] < r['test_dev_beta0']
+
+
+def test_price_drift_lowers_the_value_of_a_kept_unit():
+    # Nick, Nov 14: a kept unit sells later at today's low moved by the store-wide drift over half the sell-through time
+    from test_shadow import MODEL, SKU
+    sk = dict(SKU, pace_day=0.5, d2=5.0)
+    off = S.decide(MODEL, 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', sk, my_stock=60, tune={'drift_on': False})
+    on = S.decide(MODEL, 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', sk, my_stock=60, tune={'price_drift': 0.001})
+    assert off['price_drift'] == 0.0 and on['price_drift'] == 0.001
+    assert on['low_later'] == round(30.0 * (1 - 0.001 * on['days_to_sell'] / 2), 2)
+    assert on['v_future'] < off['v_future']
+
+
+def test_price_drift_from_keepa_histories():
+    # 60 products whose Buy Box price fell from $20.00 to $19.40 over the last 60 days: drift = -ln(0.97)/60 per day
+    import math
+    now = 10_000_000
+    p = {'csv': [None] * 18 + [[now - 200 * 1440, 2000, 0, now - 30 * 1440, 1940, 0]]}
+    d = S.price_drift([p] * 60, now_min=now)
+    assert d['asins'] == 60 and abs(d['d'] - (-math.log(0.97) / 60)) < 1e-6
+    assert S.price_drift([p] * 10, now_min=now) is None    # too few ASINs: keep the default
