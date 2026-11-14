@@ -228,3 +228,14 @@ def test_no_brakes_by_default_the_model_price_goes_through(tmp_path):
     assert lv.plan(dict(CUT, my_price=30.0, rec_price=10.0, min=5.0), t) == 22.5              # drop limit: 25% below the 24 h high
     assert lv.plan(dict(CUT, my_price=30.0, rec_price=20.0, min=24.0), t) is None             # model price below the min: not sent
     assert lv.stats['blocked']['outside min/max'] == 1
+
+
+def test_restart_keeps_waiting_for_amazon_to_show_a_recent_change(tmp_path):
+    lv, logs = live_ready(tmp_path)
+    t = time.time()
+    rec = {'t': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t - 120)), 'sku': 'S1', 'from': 35.33, 'to': 33.86, 'status_code': 200, 'response_status': 'ACCEPTED'}
+    lv.recent_log = lambda days: [rec]
+    lv.load_state()
+    assert lv.sent['S1'][2] == 33.86
+    assert lv.plan(dict(D, my_price=35.33, rec_price=36.0), t) is None          # Amazon still shows 35.33: wait
+    assert lv.stats['blocked']['waiting for Amazon to show the last change'] == 1

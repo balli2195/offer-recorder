@@ -145,6 +145,11 @@ class Live:
             if t >= cutoff:
                 self.seen[sku].append((t, r['from']))
                 self.seen[sku].append((t, r['to']))
+            if time.time() - t < SHOW_WAIT_S and r.get('response_status') in ('ACCEPTED', None):
+                # a change Amazon may not show yet: a restart must not decide again from the old price (Nov 14: a redeploy right after
+                # 35.33 -> 33.86 let the next decision see 35.33 and raise to 36.00)
+                if sku not in self.sent or self.sent[sku][0] <= t:
+                    self.sent[sku] = (t, r['from'], r['to'])
             if r['to'] < r['from']:
                 self.cuts[sku] = {'t': t, 'price': r['to'], 'low_before': r.get('low_rival'), 'answered': False}
                 self.last_cut[sku] = max(self.last_cut.get(sku, 0), t)
