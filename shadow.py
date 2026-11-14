@@ -15,6 +15,7 @@ import fees as _fees
 import demand as DM
 import ctxfeat as CX
 import limits as L
+import online as OL
 
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
@@ -485,6 +486,7 @@ class Shadow:
         self.model = None
         self.boosters = {}          # name -> lightgbm Booster (tree_foep, tree_nofoep, tree_change_*), built from the model's strings
         self.cx = CX.Live()         # per-listing context for the trees, from the offer messages
+        self.online = OL.Online(os.path.join(self.data, 'limits', 'online.json') if getattr(self, 'data', None) else None)   # per-listing correction, shadow only
         self.on_decision = None
         self.tune_fn = None      # returns the tuning dict (live config), so settings live in one place
         self.ab = None           # abtest.ABTest while the alternating-day test runs (set by app.py)
@@ -827,6 +829,17 @@ class Shadow:
         refs = {x.get('name'): (x.get('price') or {}).get('amount') for x in body.get('referencePrices') or [] if x.get('name')}
         has = any(s_.get('sellerId') for o in body.get('featuredBuyingOptions') or [] for s_ in o.get('segmentedFeaturedOffers') or [])
         now = time.time()
+        if has:   # Nick's share of the featured page views, for the per-listing online correction (shadow)
+            tot = mine = 0.0
+            for o in body.get('featuredBuyingOptions') or []:
+                if (o.get('buyingOptionType') or 'New') != 'New':
+                    continue
+                for so in o.get('segmentedFeaturedOffers') or []:
+                    for sg in so.get('featuredOfferSegments') or []:
+                        g = (sg.get('segmentDetails') or {}).get('glanceViewWeightPercentage') or 0
+                        tot += g; mine += g if so.get('sellerId') == ME else 0
+            if tot > 0:
+                self.online.on_snapshot(asin, mine / tot, now)
         with self.lock:
             if refs:
                 self.refs[asin] = (now, refs)
@@ -1103,6 +1116,11 @@ class Shadow:
                 continue
             d['t'] = self.iso()
             d['ss_repricing'] = (self.listings.get(a) or {}).get('ss_repricing')
+            pw = (d.get('cur') or {}).get('p_win')
+            if pw is not None and not d.get('suppressed'):   # shadow: log the per-listing corrected chance, prices don't use it
+                pc, off, n = self.online.corrected(a, pw, now)
+                d['online'] = {'p_win': round(pc, 4), 'offset': round(off, 3), 'n': round(n, 1)}
+                self.online.on_decision(a, d.get('my_price'), pw, now)
             if self.ab:
                 arm = self.ab.arm(d['sku'], now)
                 if arm:
@@ -1124,6 +1142,7 @@ class Shadow:
             t = dt.datetime.now(dt.timezone.utc)
             self.append_gz(os.path.join(self.data, 'shadow', t.strftime('%Y-%m-%d'), t.strftime('%H') + '.jsonl.gz'), lines)
             self.stats['last_decision'] = self.iso()
+            self.stats['online'] = self.online.stats()
         return len(lines)
 
     def loop(self):
