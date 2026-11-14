@@ -48,7 +48,8 @@ def test_decide_uses_pace_scaled_by_buy_box_chance():
     fast = S.decide(MODEL, 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', dict(SKU, pace_day=20.0, d2=500.0))
     assert fast['lam'] > base['lam'] and fast['pace_day'] == 20.0
     tied = S.p_win(MODEL, S.feats(30.0, 30.0, 1))
-    assert abs(fast['lam'] - 20.0 / 24 / max(tied, 0.25)) < 1e-3
+    w = tied + S.SALES_BETA * (1 - tied)   # sales at a share s scale with s + beta (1 - s)
+    assert abs(fast['lam'] - 20.0 / 24 / max(w, 0.25)) < 1e-3
     assert any('sales pace 20.0/day' in r for r in fast['reasons'])
 
 
@@ -61,3 +62,32 @@ def test_train_stand_in_takes_keepa_products():
     exec(line, {'sh': sh})
     sh.on_keepa_products([{'asin': 'A1', 'monthlySold': 100, 'csv': [None, None, None, [1, 500]], 'categoryTree': [{'name': 'x'}]}])
     assert 'A1' in sh.demand
+
+
+def test_sales_without_the_buy_box():
+    # units = rate x (s + beta (1 - s)): with beta > 0 a price with almost no Buy Box chance still sells, and a fitted beta in the model wins
+    from test_shadow import MODEL, SKU
+    sk = dict(SKU, pace_day=10.0, d2=100.0)
+    d0 = S.decide(dict(MODEL, sales_link={'beta_used': 0.0}), 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', sk, my_stock=50)
+    d1 = S.decide(dict(MODEL, sales_link={'beta_used': 0.3}), 'A1', {S.ME: 30.5, 'CALM': 30.0}, 'CALM', sk, my_stock=50)
+    assert d1['sales_beta'] == 0.3 and d0['sales_beta'] == 0.0
+    pw = d0['cur']['p_win']
+    assert d1['cur']['units_24h'] > d0['cur']['units_24h']
+    tied = S.p_win(MODEL, S.feats(30.0, 30.0, 1))
+    want = 10.0 * (pw + 0.3 * (1 - pw)) / max(tied + 0.3 * (1 - tied), 0.25)
+    assert abs(d1['cur']['units_24h'] - min(want, d1['qty'])) < 0.01
+
+
+def test_saleslink_fit_recovers_beta():
+    import numpy as np, saleslink as SL
+    rng = np.random.default_rng(1); seg, sales = {}, {}
+    t0, b = 0.0, 10800
+    for i in range(120):
+        a = f'A{i}'; rate = rng.uniform(0.2, 2.0); tt, ss, sl = [], [], []
+        for k in range(56):
+            s = float(rng.choice([0.0, 0.1, 0.5, 1.0])); tt.append(k * b + 60); ss.append(s)
+            q = rng.poisson(rate * (s + 0.25 * (1 - s)))
+            if q: sl.append((k * b + 120, float(q)))
+        seg[a] = (tt, ss); sales[a] = sl
+    r = SL.fit(seg, sales, t0, 56 * b, test_from=40 * b)
+    assert abs(r['beta'] - 0.25) <= 0.06 and r['test_dev'] < r['test_dev_beta0']
