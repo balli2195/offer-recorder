@@ -191,3 +191,24 @@ def test_cuts_inch_down_5_cents_then_wait_for_buy_box_or_sale(tmp_path):
     assert lv.plan(dict(CUT, my_price=26.90, rec_price=25.91), t) is None          # settable: 60-minute wait
     lv.last_cut['S1'] = t - 61 * 60
     assert lv.plan(dict(CUT, my_price=26.90, rec_price=25.91), t) == 26.80         # settable: 10-cent step
+
+
+def test_catch_up_cut_goes_straight_to_the_lowest_rival(tmp_path):
+    # Nick, Nov 14: above the lowest FBA rival, a cut goes straight down to its price (no 5-cent limit, wait or sale check);
+    # holding the Buy Box still blocks it; below the lowest rival, cuts are inched as before
+    lv, _ = live_ready(tmp_path, max_drop_pct=50)
+    sig = {'held': False, 'sold': 3}
+    lv.signals = lambda sku, asin, since: (sig['held'], sig['sold'])
+    t = time.time()
+    lv.last_cut['S1'] = lv.last_change['S1'] = t - 10 * 60          # a cut 10 min ago and sales: would block an inching cut
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91, low_rival=26.20), t) == 26.20   # straight to the rival, not below
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=26.50, low_rival=26.20), t) == 26.50   # the model's price if it's above the rival
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=20.00, low_rival=21.00), t) == 25.65   # the 5% step cap still applies
+    sig['held'] = True
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91, low_rival=26.20), t) is None    # held the Buy Box: no catch-up
+    assert lv.stats['blocked']['held the Buy Box in the last 30 min: no catch-up cut'] == 1
+    sig['held'] = False
+    assert lv.plan(dict(CUT, my_price=26.20, rec_price=25.91, low_rival=26.20), t) is None   # at the rival: inching rules again
+    lv.set_cfg({'catch_up': False})
+    lv.last_cut['S1'] = lv.last_change['S1'] = t - 31 * 60; sig['sold'] = 0
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91, low_rival=26.20), t) == 26.95   # switch off: 5-cent steps as before

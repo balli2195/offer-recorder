@@ -25,7 +25,7 @@ DEFAULTS = {'enabled': False, 'skus': [], 'max_step_pct': 5.0, 'min_interval_s':
             'chase_window_min': 30, 'chase_cuts': 2, 'freeze_h': 6.0, 'max_drop_pct': 10.0,
             # inching down (Nick, Nov 13): each cut at most max_cut_abs dollars, then wait cut_wait_min and cut again only if, in that
             # window, Nick neither held the Buy Box nor sold a unit. Raises are not limited by this.
-            'max_cut_abs': 0.05, 'cut_wait_min': 30,
+            'max_cut_abs': 0.05, 'cut_wait_min': 30, 'catch_up': True,
             # decision tuning, used by shadow and live alike; decay_auto = cost of waiting from the store's own return on inventory
             'decay_per_day': 0.003, 'decay_auto': True, 'min_gain_abs': 0.50, 'min_gain_rel': 0.05}
 
@@ -88,6 +88,7 @@ class Live:
         c['max_drop_pct'] = float(min(max(c['max_drop_pct'], 1.0), 50.0))
         c['max_cut_abs'] = round(float(min(max(c['max_cut_abs'], 0.01), 5.0)), 2)
         c['cut_wait_min'] = int(min(max(c['cut_wait_min'], 5), 240))
+        c['catch_up'] = bool(c.get('catch_up', True))
         c['decay_auto'] = bool(c['decay_auto'])
         c['decay_per_day'] = float(min(max(c['decay_per_day'], 0.0), 0.02))
         c['min_gain_abs'] = float(min(max(c['min_gain_abs'], 0.0), 50.0))
@@ -236,13 +237,24 @@ class Live:
             if sku in self.frozen:
                 return self._block('cuts paused: chased by a rival')
             wait = self.cfg['cut_wait_min'] * 60
-            if now - self.last_cut.get(sku, 0) < wait:
-                return self._block(f"waiting {self.cfg['cut_wait_min']} min after the last cut")
-            if self.signals:
-                held, sold = self.signals(sku, d.get('asin'), now - wait)
-                if held or sold:
-                    return self._block(f"Buy Box or a sale in the last {self.cfg['cut_wait_min']} min: no cut")
-            new = max(new, round(me - self.cfg['max_cut_abs'], 2))
+            low = d.get('low_rival')
+            if self.cfg.get('catch_up', True) and low and me > low + 0.005:
+                # catching up (Nick, Nov 14): above the lowest FBA rival, a cut may go straight down to its price (within the step cap and
+                # min) without the 5-cent limit, the wait or the sale check, so rival drops don't leave Nick stranded above them. Holding
+                # the Buy Box in the last 30 min still blocks it (he's winning at the higher price). Going below the lowest rival is inched.
+                if self.signals:
+                    held, _ = self.signals(sku, d.get('asin'), now - wait)
+                    if held:
+                        return self._block(f"held the Buy Box in the last {self.cfg['cut_wait_min']} min: no catch-up cut")
+                new = max(new, round(low, 2))
+            else:
+                if now - self.last_cut.get(sku, 0) < wait:
+                    return self._block(f"waiting {self.cfg['cut_wait_min']} min after the last cut")
+                if self.signals:
+                    held, sold = self.signals(sku, d.get('asin'), now - wait)
+                    if held or sold:
+                        return self._block(f"Buy Box or a sale in the last {self.cfg['cut_wait_min']} min: no cut")
+                new = max(new, round(me - self.cfg['max_cut_abs'], 2))
             high = max([p for _, p in self.seen[sku]] + [me])
             floor = math.ceil(high * (1 - self.cfg['max_drop_pct'] / 100.0) * 100 - 1e-6) / 100.0
             if new < floor:
