@@ -27,7 +27,7 @@ def test_blocks_when_seller_snap_still_repricing(tmp_path):
 
 def test_step_limit_and_bounds(tmp_path):
     lv, _ = mk(tmp_path)
-    lv.set_cfg({'enabled': True, 'skus': ['S1'], 'max_step_pct': 5})
+    lv.set_cfg({'enabled': True, 'skus': ['S1'], 'max_step_pct': 5, 'brakes': True})
     lv.on_listings([{'sku': 'S1', 'repricing': False}])
     assert lv.plan(D) == 31.5                      # 30 -> 33 requested, capped at +5 %
     assert lv.plan(dict(D, rec_price=45.0)) is None and lv.stats['blocked']['outside min/max'] == 1
@@ -57,7 +57,7 @@ def test_patch_keeps_other_offer_fields(tmp_path):
 
 def test_apply_logs_and_counts(tmp_path, monkeypatch):
     lv, logs = mk(tmp_path)
-    lv.set_cfg({'enabled': True, 'skus': ['S1']})
+    lv.set_cfg({'enabled': True, 'skus': ['S1'], 'brakes': True})
     lv.on_listings([{'sku': 'S1', 'repricing': False}])
     sent = {}
     monkeypatch.setattr(lv, '_get_item', lambda sku, tok: {'summaries': [{'productType': 'BEAUTY'}], 'attributes': {}})
@@ -94,7 +94,7 @@ def live_ready(tmp_path, **cfg):
 
 
 def test_chased_cuts_pause_cuts_but_not_raises(tmp_path):
-    lv, _ = live_ready(tmp_path, chase_cuts=2, chase_window_min=30, max_drop_pct=50, max_cut_abs=5)   # whole-dollar cuts: the chase brake, not inching
+    lv, _ = live_ready(tmp_path, chase_cuts=2, chase_window_min=30, max_drop_pct=50, max_cut_abs=5, brakes=True)   # whole-dollar cuts: the chase brake, not inching
     t = time.time()
     lv.maybe_apply(dict(CUT))                                   # cut 30 -> 29
     lv.observe(dict(CUT, my_price=29.0, low_rival=29.0), t + 300)  # a rival matched within 5 min
@@ -169,7 +169,7 @@ def test_waits_for_amazon_to_show_the_last_change(tmp_path, monkeypatch):
 
 
 def test_cuts_inch_down_5_cents_then_wait_for_buy_box_or_sale(tmp_path):
-    lv, _ = live_ready(tmp_path, max_drop_pct=50)
+    lv, _ = live_ready(tmp_path, max_drop_pct=50, brakes=True)
     sig = {'held': False, 'sold': 0}
     lv.signals = lambda sku, asin, since: (sig['held'], sig['sold'])
     t = time.time()
@@ -196,7 +196,7 @@ def test_cuts_inch_down_5_cents_then_wait_for_buy_box_or_sale(tmp_path):
 def test_catch_up_cut_goes_straight_to_the_lowest_rival(tmp_path):
     # Nick, Nov 14: above the lowest FBA rival, a cut goes straight down to its price (no 5-cent limit, wait or sale check);
     # holding the Buy Box still blocks it; below the lowest rival, cuts are inched as before
-    lv, _ = live_ready(tmp_path, max_drop_pct=50)
+    lv, _ = live_ready(tmp_path, max_drop_pct=50, brakes=True)
     sig = {'held': False, 'sold': 3}
     lv.signals = lambda sku, asin, since: (sig['held'], sig['sold'])
     t = time.time()
@@ -212,3 +212,19 @@ def test_catch_up_cut_goes_straight_to_the_lowest_rival(tmp_path):
     lv.set_cfg({'catch_up': False})
     lv.last_cut['S1'] = lv.last_change['S1'] = t - 31 * 60; sig['sold'] = 0
     assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91, low_rival=26.20), t) == 26.95   # switch off: 5-cent steps as before
+
+
+def test_no_brakes_by_default_the_model_price_goes_through(tmp_path):
+    # Nick, Nov 14: brakes off by default; only min/max, the 24 h drop limit (25%), spacing and the daily cap remain
+    lv, _ = live_ready(tmp_path)
+    assert lv.cfg['brakes'] is False and lv.cfg['max_drop_pct'] == 25.0
+    sig = {'held': True, 'sold': 3}
+    lv.signals = lambda sku, asin, since: (sig['held'], sig['sold'])
+    t = time.time()
+    lv.last_cut['S1'] = t - 60
+    lv.frozen['S1'] = {'until': t + 3600, 'why': 'test'}
+    assert lv.plan(dict(CUT, my_price=27.0, rec_price=25.91, low_rival=26.20), t) == 25.91   # below the rival, no inching, wait or pause
+    assert lv.plan(dict(D, rec_price=36.0), t) == 36.0                                         # no 5% step cap on raises
+    assert lv.plan(dict(CUT, my_price=30.0, rec_price=10.0, min=5.0), t) == 22.5              # drop limit: 25% below the 24 h high
+    assert lv.plan(dict(CUT, my_price=30.0, rec_price=20.0, min=24.0), t) is None             # model price below the min: not sent
+    assert lv.stats['blocked']['outside min/max'] == 1

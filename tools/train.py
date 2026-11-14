@@ -487,6 +487,82 @@ if V2 and lgb is not None and len(D) > 2000:
             if judge('tree_change_' + name, sigm(z2 + bc.predict(Xof(cte), raw_score=True)), sigm(z2), cte.y.values):
                 bcf = tree(Cw, zc(Cw, model['bb_change_' + name]['coef']), rounds=bc.best_iteration)
                 model['tree_change_' + name] = {'booster': bcf.model_to_string(), 'features': CX.FEATURES, 'rounds': int(bc.best_iteration)}
+    # ---------------- unified with-target model (Nick, Nov 14; BUYBOX_UNIFIED_MODEL_TEST_2026-11-14.md)
+    # One logistic (shadow.unified_feats: Buy Box + holder inputs, no stock share, change terms, is_change and is_change x every input)
+    # and one shared tree (context + is_change), trained on holding moments (as 0% changes) and price changes together, then a Platt
+    # correction per kind fitted on the held-back last day. Tested walk-forward Nov 10-13: holding MSE -4.7%, after a change -0.7%,
+    # top-band overconfidence after a change +1.9 pts vs +3.5. Replaces the with-target ordinary pair + tree and the post-change model + tree
+    # in shadow.decide; kept only if, on the held-out last 2 days, it beats the current setup on holding moments and is no more than 1%
+    # worse after a change.
+    if len(CHD) >= 2000:
+        try:
+            ufx = lambda r, chg: S.unified_feats(r.me, r.frm if chg else r.me, r.low, r.n, r.foep,
+                                                 {'kind': r.hk, 'price': None if pd.isna(r.hp) else r.hp})
+            Dw = D[D.foep.notna()]; Cw = CHD[CHD.foep.notna()]
+            def u_fit(dr, cr):
+                xs = [ufx(r, False) for r in dr.itertuples()] + [ufx(r, True) for r in cr.itertuples()]
+                keys = sorted(set().union(*[x.keys() for x in xs])); X = np.array([[x.get(k, 0.0) for k in keys] for x in xs])
+                y = np.r_[dr.y.values, cr.y.values]
+                m = LogisticRegression(C=1.0, max_iter=3000, fit_intercept=False).fit(np.vstack([X, X]), np.r_[np.ones(len(y)), np.zeros(len(y))], sample_weight=np.r_[y, 1 - y] + 1e-6)
+                return dict(zip(keys, [float(c) for c in m.coef_[0]]))
+            uz = lambda c, rows, chg: np.array([zlin(c, ufx(r, chg)) for r in rows.itertuples()])
+            UF = CX.FEATURES + ['is_change']
+            uX = lambda dr, cr: np.vstack([np.c_[Xof(dr), np.zeros(len(dr))] if len(dr) else np.zeros((0, len(UF))),
+                                           np.c_[Xof(cr), np.ones(len(cr))] if len(cr) else np.zeros((0, len(UF)))]).astype(np.float32)
+            def u_train(dr, cr, dv, cv):
+                c = u_fit(dr, cr)
+                zf = np.r_[uz(c, dr, False), uz(c, cr, True)]; zv = np.r_[uz(c, dv, False), uz(c, cv, True)]
+                d = lgb.Dataset(uX(dr, cr), np.r_[dr.y.values, cr.y.values], init_score=zf, feature_name=UF, free_raw_data=True)
+                v = lgb.Dataset(uX(dv, cv), np.r_[dv.y.values, cv.y.values], init_score=zv, reference=d)
+                b = lgb.train(TREE_PARAMS, d, 2000, valid_sets=[v], callbacks=[lgb.early_stopping(100, verbose=False)])
+                ph = sigm(uz(c, dv, False) + b.predict(uX(dv, dv.iloc[:0]), raw_score=True))
+                pc = sigm(uz(c, cv, True) + b.predict(uX(cv.iloc[:0], cv), raw_score=True))
+                def platt_fit(p, y):
+                    lp = np.log(np.clip(p, 1e-4, 1 - 1e-4) / (1 - np.clip(p, 1e-4, 1 - 1e-4)))[:, None]
+                    m = LogisticRegression(C=1e6, max_iter=1000).fit(np.vstack([lp, lp]), np.r_[np.ones(len(y)), np.zeros(len(y))], sample_weight=np.r_[y, 1 - y] + 1e-6)
+                    return [round(float(m.coef_[0][0]), 4), round(float(m.intercept_[0]), 4)]
+                return c, b, {'hold': platt_fit(ph, dv.y.values), 'change': platt_fit(pc, cv.y.values)}
+            def u_pred(c, b, pl, rows, chg):
+                X = uX(rows, rows.iloc[:0]) if not chg else uX(rows.iloc[:0], rows)
+                p = sigm(uz(c, rows, chg) + b.predict(X, raw_score=True))
+                a_, b0 = pl['change' if chg else 'hold']
+                lp = np.log(np.clip(p, 1e-4, 1 - 1e-4) / (1 - np.clip(p, 1e-4, 1 - 1e-4)))
+                return sigm(a_ * lp + b0)
+            # held-out test: train before vcut, early stopping + Platt on vcut..cutoff, test on the last 2 days
+            trd, ted = Dw[Dw.t < cutoff], Dw[Dw.t >= cutoff]; trc, tec = Cw[Cw.t < cutoff], Cw[Cw.t >= cutoff]
+            c_t, b_t, pl_t = u_train(trd[trd.t < vcut], trc[trc.t < vcut], trd[trd.t >= vcut], trc[trc.t >= vcut])
+            # the current setup on the same test rows, fitted the same way (ordinary pair + tree; post-change model + tree)
+            fw, vw = trd[trd.t < vcut], trd[trd.t >= vcut]
+            cp_f = fit(fw, True); ch_f = fit(NOT_ME(fw), True, True) if 'bb_foep_h' in model else None
+            bo = tree(fw, base_z(fw, True, cp_f, ch_f), vw, base_z(vw, True, cp_f, ch_f))
+            ph_cur = sigm(base_z(ted, True, cp_f, ch_f) + bo.predict(Xof(ted), raw_score=True))
+            cfw, cvw = trc[trc.t < vcut], trc[trc.t >= vcut]
+            cc_f = fit_ch(cfw, True); zc = lambda rows, c: np.array([zlin(c, chfx(r, True)) for r in rows.itertuples()])
+            bc = tree(cfw, zc(cfw, cc_f), cvw, zc(cvw, cc_f))
+            pc_cur = sigm(zc(tec, cc_f) + bc.predict(Xof(tec), raw_score=True))
+            ph_u = u_pred(c_t, b_t, pl_t, ted, False); pc_u = u_pred(c_t, b_t, pl_t, tec, True)
+            yh, yc = ted.y.values, tec.y.values
+            rep = {'test_rows_hold': int(len(yh)), 'test_rows_change': int(len(yc)),
+                   'mse_hold_new': round(mse(ph_u, yh), 4), 'mse_hold_current': round(mse(ph_cur, yh), 4),
+                   'mse_change_new': round(mse(pc_u, yc), 4), 'mse_change_current': round(mse(pc_cur, yc), 4),
+                   'mean_hold_new': round(float(ph_u.mean()), 4), 'mean_change_new': round(float(pc_u.mean()), 4),
+                   'mean_hold_actual': round(float(yh.mean()), 4), 'mean_change_actual': round(float(yc.mean()), 4), 'platt_test': pl_t}
+            why = []
+            if len(yh) < 500 or len(yc) < 300: why.append('too few test rows')
+            if rep['mse_hold_new'] >= rep['mse_hold_current']: why.append('holding MSE not better')
+            if rep['mse_change_new'] > rep['mse_change_current'] * 1.01: why.append('after-a-change MSE more than 1% worse')
+            if abs(rep['mean_hold_new'] - rep['mean_hold_actual']) > 0.05 or abs(rep['mean_change_new'] - rep['mean_change_actual']) > 0.05:
+                why.append('average off by more than 5 points')
+            rep.update(kept=not why, why_not=why)
+            if not why:   # final: everything before the last day, early stopping + Platt on the last day
+                last = T1 - 86400
+                c_f, b_f, pl_f = u_train(Dw[Dw.t < last], Cw[Cw.t < last], Dw[Dw.t >= last], Cw[Cw.t >= last])
+                model['bb_unified'] = {'coef': c_f, 'platt': pl_f}
+                model['tree_unified'] = {'booster': b_f.model_to_string(), 'features': UF, 'rounds': int(b_f.best_iteration)}
+                rep['platt'] = pl_f
+            V2_REPORT['unified'] = rep
+        except Exception as e:
+            V2_REPORT['unified'] = {'kept': False, 'error': f'{type(e).__name__}: {str(e)[:300]}'}
     model['label'] = 'held: page-view share until the next own price change, at most 6 h'
     model['v2'] = V2_REPORT
     print('v2 models', json.dumps(V2_REPORT), flush=True)

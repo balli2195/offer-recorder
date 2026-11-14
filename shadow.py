@@ -83,6 +83,27 @@ def change_terms(new, old, h_me):
     return {'c_raise': up, 'c_raise_me': up * h_me, 'c_step': step, 'c_step_raise': step * up}
 
 
+def unified_feats(p, old, low_rival, n_rivals, foep, holder):
+    """Inputs of the unified with-target Buy Box model (Nick, Nov 14; BUYBOX_UNIFIED_MODEL_TEST_2026-11-14): one logistic scores both
+    holding the current price (p == old, a 0% change) and any other price. The Buy Box inputs with the holder, no stock share (it adds
+    nothing once Amazon's target is known: STOCK_SHARE_VS_TARGET_2026-11-14), the change terms, an is_change flag and is_change x every
+    input, so prices after a change get their own slopes."""
+    x = feats(p, low_rival, n_rivals, foep, None, holder)
+    x.update(change_terms(p, old, x.get('h_me', 0.0)))
+    c = 1.0 if abs(p - old) >= 0.005 else 0.0
+    x.update({'chg_x_' + k: v * c for k, v in list(x.items())})
+    x['is_change'] = c
+    return x
+
+
+def platt(p, ab):
+    """Calibration fitted nightly on the held-back last day: p' = sigmoid(a logit(p) + b)."""
+    if not ab:
+        return p
+    p = clip(p, 1e-4, 1 - 1e-4)
+    return sigmoid(ab[0] * math.log(p / (1 - p)) + ab[1])
+
+
 # ---------------------------------------------------------------- economics
 def fee(p, sku):
     """Amazon's fee at price p: from Amazon's own estimates when loaded (sku['fees'] = bands), else 8%/15% referral + a typical FBA fee."""
@@ -318,7 +339,23 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
                 t_chg = float(boosters['tree_change_' + fk].predict([v], raw_score=True)[0]); parts.append('change tree')
     if chg:
         parts.append('post-change model')
+    uni = model.get('bb_unified') if use_foep else None   # Nov 14: one model for the current price and every candidate when a target is known
+    t_uh = t_uc = 0.0
+    if uni:
+        parts = ['unified model']
+        if boosters and ctx_fn and 'tree_unified' in boosters:
+            v = ctx_fn(n_riv, 'me' if winner == ME else h_kind)
+            if v is not None:
+                b_ = boosters['tree_unified']
+                t_uh = float(b_.predict([list(v) + [0.0]], raw_score=True)[0]); t_uc = float(b_.predict([list(v) + [1.0]], raw_score=True)[0])
+                parts.append('unified tree')
+        if uni.get('platt'):
+            parts.append('calibrated')
     def P(p, low_, changed):
+        if uni:
+            x = unified_feats(p, p if not changed else me, low_, n_riv, use_foep, {'kind': h_kind, 'price': h_price})
+            z = sum(uni['coef'].get(k, 0.0) * v for k, v in x.items()) + (t_uc if changed else t_uh)
+            return platt(sigmoid(z), (uni.get('platt') or {}).get('change' if changed else 'hold'))
         if changed and chg:
             x = feats(p, low_, n_riv, use_foep, share, {'kind': h_kind, 'price': h_price})
             x.update(change_terms(p, me, x.get('h_me', 0.0)))
@@ -526,7 +563,7 @@ class Shadow:
             self.stats['last_error'] = f'lightgbm: {type(e).__name__}: {e}'
             return out
         for k in names:
-            if m[k].get('features') != CX.FEATURES:
+            if m[k].get('features') != (CX.FEATURES + ['is_change'] if k == 'tree_unified' else CX.FEATURES):
                 self.stats['last_error'] = f'{k}: feature list differs from ctxfeat.FEATURES; not used'
                 continue
             out[k] = lgb.Booster(model_str=m[k]['booster'])
