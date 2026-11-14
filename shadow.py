@@ -18,6 +18,7 @@ import limits as L
 
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
+SALES_BETA = 0.20   # sales with no featured share, as a fraction of sales at 100% (saleslink.py); the nightly fit replaces it
 FOEP_MAX_AGE = 45 * 60
 FOEP_REFRESH_S = 300       # a listing that changes with a target older than this gets its target read first in the next call (Nov 13)
 MIN_GAIN_ABS = 0.50      # $/day of expected profit before a change is recommended
@@ -290,16 +291,22 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             x.update(change_terms(p, me, x.get('h_me', 0.0)))
             return sigmoid(sum(chg['coef'].get(k, 0.0) * v for k, v in x.items()) + t_chg)
         return sigmoid(z_win(model, feats(p, low_, n_riv, use_foep, share, hold_at(p))) + t_ord)
+    # Sales at a Buy Box share s scale with s + beta (1 - s) (saleslink.py): beta = sales with no featured share as a fraction of
+    # sales at a 100% share (buyers who pick Nick from the other-sellers list); fitted nightly, 0.20 until then (Nick, Nov 13).
+    beta = float(((model or {}).get('sales_link') or {}).get('beta_used', SALES_BETA))
+    wt = lambda s_: s_ + beta * (1.0 - s_)
     lam = sku['lam']
+    if sku.get('bbs') is not None:   # pace from 30-day sales at the current share: scaled to a 100% share the same way
+        lam = max(sku.get('v30') or 0.0, 0.01) / 24.0 / max(wt(sku['bbs']), 0.25)
     if sku.get('pace_day'):   # sales-model pace (demand.py): the units/day when priced level with the lowest rival; scale by the Buy Box chance at each price
         pw_ref = P(low, low, False)
-        lam = sku['pace_day'] / 24.0 / max(pw_ref, 0.25)
+        lam = sku['pace_day'] / 24.0 / max(wt(pw_ref), 0.25)
     rate = max((rival_info(model, s, asin)[0] for s in near), default=model['rival_default']['rate'])
     lag = min((rival_info(model, s, asin)[1] for s in near), default=model['rival_default']['lag_min'])
     p_now = P(me, low, False)
     qty = my_stock if my_stock is not None else (sku.get('qty') or 1)
     qty = max(qty, 1)
-    daily_now = lam * 24.0 * p_now
+    daily_now = lam * 24.0 * wt(p_now)
     days_to_sell = min(qty / max(daily_now, 0.05), 180.0)
     # What is already paid for is sunk: a unit sold now is worth its net proceeds; a unit kept is worth selling it later
     # near today's market low, less the cost of waiting (capital, storage, price erosion) over about half the sell-through time.
@@ -319,7 +326,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             pen = war_penalty_pct(model, rate) / 100.0 * low * (1 - ref_low) * exposed
         else:
             pw = pw_alone
-        units = min(lam * HORIZON_H * pw, qty)
+        units = min(lam * HORIZON_H * wt(pw), qty)
         ev = units * ((p - f_p) - v_future) - pen
         rows.append({'price': p, 'p_win': round(pw, 4), 'units_24h': round(units, 3), 'fees': round(f_p, 2), 'margin': round(m, 2),
                      'roi': round(m / sku['cost'], 4) if sku['cost'] else None, 'profit_24h': round(units * m, 2),
@@ -366,7 +373,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
         reasons.append("fees estimated (Amazon's fee for this SKU not loaded yet)")
     rec_row = best if change else cur
     return {'asin': asin, 'sku': sku['sku'], 'my_price': me, 'low_rival': low, 'n_rivals': n_riv, 'winner': winner, 'suppressed': False,
-            'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
+            'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'sales_beta': round(beta, 3), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
             'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered,
@@ -674,7 +681,7 @@ class Shadow:
             for k, v in (('cost', csrc), ('min', nsrc), ('max', xsrc), ('sales', dsrc)):
                 src[f'{k}: {v}'] += 1
             out[asin] = {'sku': sku, 'title': (c.get('title') or r.get('title') or '')[:120], 'min': round(mn, 2), 'max': round(mx, 2), 'cost': round(cost, 4),
-                         'listed': c.get('price') or r.get('listed_price'), 'v30': round(v30, 4), 'lam': max(v30, 0.01) / 24.0 / bbs,
+                         'listed': c.get('price') or r.get('listed_price'), 'v30': round(v30, 4), 'lam': max(v30, 0.01) / 24.0 / bbs, 'bbs': bbs,
                          'qty': iv.get('fulfillable', r.get('qty')), 'ss_repricing': bool(r.get('repricing')) if r else False,
                          'src': {'cost': csrc, 'min': nsrc, 'max': xsrc, 'sales': dsrc},
                          'ss_min': r.get('min_price'), 'ss_max': r.get('max_price'), 'ss_cost': r.get('cost'),

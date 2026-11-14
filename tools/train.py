@@ -16,6 +16,7 @@ import numpy as np, pandas as pd, requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import shadow as S
 import ctxfeat as CX
+import saleslink as SL
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
@@ -167,9 +168,11 @@ for pth in ([] if A.rivals_only else want('segments')):
                 for sgm in so.get('featuredOfferSegments') or []:
                     g = (sgm.get('segmentDetails') or {}).get('glanceViewWeightPercentage') or 0.0
                     tot += g; mine_ += g if so.get('sellerId') == ME else 0.0
-        _sg[a_].append((ts_(x['taken_at']), mine_ / tot if tot > 0 else 0.0))
+        _sg[a_].append((ts_(x['taken_at']), mine_ / tot if tot > 0 else 0.0, tot > 0))
+SEG_SL = {}   # the same, only snapshots with a featured offer (for the sales link: with none, nobody is featured)
 for a_, v in _sg.items():
     v.sort(); SEG[a_] = ([q[0] for q in v], [q[1] for q in v])
+    SEG_SL[a_] = ([q[0] for q in v if q[2]], [q[1] for q in v if q[2]])
 del _sg
 print('segment snapshots', sum(len(v[0]) for v in SEG.values()), 'asins', len(SEG), flush=True)
 inv = collections.defaultdict(list)
@@ -487,6 +490,40 @@ if V2 and lgb is not None and len(D) > 2000:
     model['label'] = 'held: page-view share until the next own price change, at most 6 h'
     model['v2'] = V2_REPORT
     print('v2 models', json.dumps(V2_REPORT), flush=True)
+# ---------------- sales link (saleslink.py): units = rate x (s + beta (1 - s)); beta = sales with no featured share as a fraction of
+# sales at a 100% share. Fitted on Nick's orders and segment snapshots over the window, checked on the last 2 days against beta = 0.
+if not A.rivals_only:
+    _ord = {}
+    for pth in want('orders'):
+        for l in get(pth):
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            k = (r.get('amazon-order-id'), r.get('order-item-id') or r.get('sku'))
+            if k not in _ord or (r.get('last-updated-date') or '') >= (_ord[k].get('last-updated-date') or ''):
+                _ord[k] = r
+    sales = collections.defaultdict(list)
+    for r in _ord.values():
+        if r.get('order-status') == 'Cancelled' or r.get('sales-channel') != 'Amazon.com' or not r.get('asin'):
+            continue
+        try:
+            sales[r['asin']].append((ts_(r['purchase-date']), float(r.get('quantity') or 0)))
+        except (KeyError, ValueError):
+            continue
+    del _ord
+    t_end = max((t for v in SEG_SL.values() for t in v[0][-1:]), default=0)
+    sl = SL.fit(SEG_SL, sales, t_end - A.days * 86400, t_end, skip=[STRANDED], test_from=t_end - 2 * 86400) if t_end else None
+    why = []
+    if not sl:
+        why.append('no data')
+    else:
+        if sl['units'] < 500: why.append(f"only {sl['units']:.0f} units")
+        if sl['asins'] < 50: why.append(f"only {sl['asins']} ASINs with sales")
+        if not (0.0 <= sl['beta'] <= 0.6): why.append(f"beta {sl['beta']} outside 0-0.6")
+        if sl.get('test_dev') is None or sl['test_dev'] >= sl.get('test_dev_beta0', 0): why.append('no gain over beta = 0 on the held-out days')
+    model['sales_link'] = dict(sl or {}, kept=not why, reasons=why, beta_used=sl['beta'] if (sl and not why) else SL.DEFAULT_BETA)
+    print('sales link', json.dumps(model['sales_link']), flush=True)
 # ---------------- safety check: new vs current model on the same held-out days
 def score(coefs, name, wf):
     return {k: v for k, v in metrics(coefs, name, te, wf, False).items() if k in ('auc', 'brier', 'mean_pred')}
