@@ -18,6 +18,7 @@ import limits as L
 
 ME = 'A2UYRB3AYUMGAJ'
 HORIZON_H = 24.0
+PRICE_DRIFT = 0.00045   # store-wide Buy Box price change per day, as a fall (Nov 14: -0.045%/day over the last 30-90 days); the weekly Keepa year pull replaces it
 SALES_BETA = 0.20   # sales with no featured share, as a fraction of sales at 100% (saleslink.py); the nightly fit replaces it
 FOEP_MAX_AGE = 45 * 60
 FOEP_REFRESH_S = 300       # a listing that changes with a target older than this gets its target read first in the next call (Nov 13)
@@ -173,6 +174,37 @@ def suppression(n):
     return sup, lo[0], lo[1]
 
 
+def price_drift(products, days=60, now_min=None, min_asins=50, cap=0.002):
+    """Store-wide Buy Box price drift per day (> 0 = falling) from Keepa products with a year of history: the mean over ASINs of
+    -(log of the mean price over the last 7 days - log of the price `days` ago) / days, clipped to +-cap. Needs min_asins ASINs.
+    Measured Nov 14 2026: -0.045%/day (30, 60 and 90 days alike); 60-day changes ran -1.5% to -2.9% for every start month in 2026."""
+    import math, bisect
+    out = []
+    for p in products:
+        cs = p.get('csv') or []
+        b = cs[18] if len(cs) > 18 and cs[18] else None
+        if not b or len(b) < 6:
+            continue
+        t, v = b[0::3], [(x + (y if y and y > 0 else 0)) if x and x > 0 else None for x, y in zip(b[1::3], b[2::3])]
+        end = now_min or t[-1]
+
+        def at(m):
+            k = bisect.bisect_right(t, m) - 1
+            return v[k] if k >= 0 else None
+        if t[0] > end - days * 1440:
+            continue
+        old = at(end - days * 1440)
+        recent = [at(end - d * 1440) for d in range(7)]
+        recent = [x for x in recent if x]
+        if not old or not recent:
+            continue
+        out.append(-(math.log(sum(recent) / len(recent)) - math.log(old)) / days)
+    if len(out) < min_asins:
+        return None
+    d = sum(out) / len(out)
+    return {'d': round(max(-cap, min(cap, d)), 6), 'asins': len(out), 't': __import__('time').time()}
+
+
 def decide_suppressed(asin, offers, sku, low_any, low_ch, qty, tune=None, me_backordered=False):
     """Buy Box suppressed (Nick, Nov 12 2026): don't chase Amazon's target price; match the lowest offer on the listing
     (any fulfillment, landed price), within min/max, and let the usual step limits and brakes work from there."""
@@ -311,7 +343,12 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
     # What is already paid for is sunk: a unit sold now is worth its net proceeds; a unit kept is worth selling it later
     # near today's market low, less the cost of waiting (capital, storage, price erosion) over about half the sell-through time.
     f_low, ref_low = fee(low, sku)
-    v_future = (low - f_low) * (1.0 - decay * days_to_sell / 2.0)
+    # Price erosion (Nick, Nov 14): a kept unit sells later at today's low moved by the store-wide drift over about half the
+    # sell-through time (drift > 0 = prices falling). A listing's own trend isn't used: it reverses more than it continues.
+    drift = float(tune.get('price_drift', PRICE_DRIFT)) if tune.get('drift_on', True) else 0.0
+    low_later = low * max(1.0 - drift * days_to_sell / 2.0, 0.5)
+    f_later, _ = fee(low_later, sku)
+    v_future = (low_later - f_later) * (1.0 - decay * days_to_sell / 2.0)
     exposed = min(qty, max(daily_now, 0.05) * 30.0)   # units whose future value a price war would lower
     rows = []
     for p in cands:
@@ -376,7 +413,7 @@ def decide(model, asin, offers, winner, sku, foep=None, foep_age=None, my_stock=
             'foep': use_foep, 'rec_price': rec, 'qty': qty, 'days_to_sell': round(days_to_sell, 1), 'sales_beta': round(beta, 3), 'v_future': round(v_future, 2), 'action': action, 'gain_24h': round(gain if change else 0.0, 2),
             'cur': cur, 'best': best, 'reasons': reasons, 'min': lo, 'max': hi, 'lam': round(lam, 4),
             'profit_day_now': cur['profit_24h'], 'profit_day_rec': rec_row['profit_24h'], 'roi_now': cur['roi'], 'roi_rec': rec_row['roi'],
-            'fees_src': fees_src, 'decay': round(decay, 5), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered,
+            'fees_src': fees_src, 'decay': round(decay, 5), 'price_drift': round(drift, 5), 'low_later': round(low_later, 2), 'backordered': me_backordered, 'rivals_backordered': rivals_backordered,
             'pace_day': sku.get('pace_day'), 'd2': sku.get('d2'), 'bb_parts': parts}
 
 
@@ -426,6 +463,7 @@ class Shadow:
         self.fees = {}              # sku -> {'t', 'bands'} from Amazon's fee estimates
         self.fba_median = FALLBACK_FBA
         self.capital_rate = None    # profit per day / money tied up in inventory (cost + prep, on hand and inbound)
+        self.drift = None           # store-wide Buy Box price drift per day from the Keepa year pull ({'d', 'asins', 't'})
         self.refs = {}              # asin -> (t, {CompetitivePrice, WasPrice, ...}) from the competitive summary sweep
         self.featured = {}          # asin -> (t, has a featured offer) from the same sweep
         self.sup_since = {}         # asin -> first time seen suppressed in this run
@@ -571,7 +609,7 @@ class Shadow:
 
     def load_state(self):
         for name, attr in (('limits.json', 'limits'), ('fba_high.json', 'fba_high'), ('traffic.json', 'traffic'), ('demand.json', 'demand'),
-                           ('foep.json', 'foep')):
+                           ('foep.json', 'foep'), ('drift.json', 'drift')):
             try:
                 with open(self.state_path(name)) as f:
                     v = json.load(f)
@@ -987,6 +1025,11 @@ class Shadow:
                 h = L.fba_year_high(p, now_min=int(time.time() / 60) - L.KEEPA_EPOCH_MIN)
                 if h:
                     highs[p['asin']] = h
+        dr = price_drift([p for p in products or [] if p.get('asin') in highs], now_min=int(time.time() / 60) - L.KEEPA_EPOCH_MIN)
+        if dr:
+            with self.lock:
+                self.drift = dr
+            self.save_state('drift.json', dr)
         if highs:
             with self.lock:
                 self.fba_high.update(highs)
@@ -1034,6 +1077,9 @@ class Shadow:
         tune = dict(self.tune_fn() or {}) if self.tune_fn else {}
         if tune.get('decay_auto', True) and crate:
             tune['decay_per_day'] = crate
+        dr = self.drift
+        if 'price_drift' not in tune and dr and dr.get('d') is not None:
+            tune['price_drift'] = dr['d']
         return decide(model, asin, offs, win, sku, foep, age, st, rstock, tune=tune,
                       suppressed=ex.get('suppressed', False), low_any=ex.get('low_any'), low_ch=ex.get('low_ch'),
                       me_backordered=ex.get('me_backordered', False), rivals_backordered=ex.get('rivals_backordered', 0),
